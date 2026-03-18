@@ -1,4 +1,5 @@
 from .annotation import TAB as ANNOTATION_TAB
+from .fangte import TAB as FANGTE_TAB
 from .formatting import TAB as FORMAT_TAB
 from .general import TAB as GENERAL_TAB
 from .insert import TAB as INSERT_TAB
@@ -12,6 +13,7 @@ from .view import TAB as VIEW_TAB
 
 ALL_TABS = (
     GENERAL_TAB,
+    FANGTE_TAB,
     INSERT_TAB,
     FORMAT_TAB,
     TOOLS_TAB,

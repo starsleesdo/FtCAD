@@ -149,6 +149,27 @@ class Canvas(QWidget):
             rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
             painter.drawArc(rect, self._qt_angle(start_angle), self._qt_span(span_angle))
             painter.restore()
+        elif shape_type == 'text':
+            x, y, text, height, rotation = shape['params']
+            if not text:
+                return
+            painter.save()
+            font = QFont('Microsoft YaHei UI')
+            size = float(height) if height and height > 0 else 12.0 * max(0.1, self.zoom_factor)
+            font.setPixelSize(max(1, int(round(size))))
+            painter.setFont(font)
+            lines = str(text).splitlines() or [str(text)]
+            metrics = painter.fontMetrics()
+            line_height = metrics.height()
+            if rotation:
+                painter.translate(x, y)
+                painter.rotate(rotation)
+                for idx, line in enumerate(lines):
+                    painter.drawText(0, int(idx * line_height), line)
+            else:
+                for idx, line in enumerate(lines):
+                    painter.drawText(int(x), int(y + idx * line_height), line)
+            painter.restore()
 
     def _draw_shape_geometry(self, painter, shape):
         shape_type = shape['type']
@@ -203,6 +224,27 @@ class Canvas(QWidget):
             p2b = QPointF(x2 - nx * offset, y2 - ny * offset)
             painter.drawLine(p1a, p2a)
             painter.drawLine(p1b, p2b)
+        elif shape_type == 'text':
+            x, y, text, height, rotation = shape['params']
+            if not text:
+                return
+            painter.save()
+            font = QFont('Microsoft YaHei UI')
+            size = float(height) if height and height > 0 else 12.0 * max(0.1, self.zoom_factor)
+            font.setPixelSize(max(1, int(round(size))))
+            painter.setFont(font)
+            lines = str(text).splitlines() or [str(text)]
+            metrics = painter.fontMetrics()
+            line_height = metrics.height()
+            if rotation:
+                painter.translate(x, y)
+                painter.rotate(rotation)
+                for idx, line in enumerate(lines):
+                    painter.drawText(0, int(idx * line_height), line)
+            else:
+                for idx, line in enumerate(lines):
+                    painter.drawText(int(x), int(y + idx * line_height), line)
+            painter.restore()
 
     def _draw_selection_highlight(self, painter):
         if not self.selected_indices:
@@ -410,11 +452,11 @@ class Canvas(QWidget):
 
     def _linetype_to_penstyle(self, value):
         key = str(value or "").strip().lower()
-        if key in ("dashed",):
+        if "dash" in key:
             return Qt.DashLine
-        if key in ("center",):
+        if "center" in key:
             return Qt.DashDotLine
-        if key in ("phantom",):
+        if "phantom" in key:
             return Qt.DashDotDotLine
         return Qt.SolidLine
 
@@ -446,6 +488,12 @@ class Canvas(QWidget):
     def add_line(self, x1, y1, x2, y2):
         self._push_undo()
         self._append_shape({'type': 'line', 'params': (x1, y1, x2, y2)})
+        self.update()
+
+    def add_centerline(self, x1, y1, x2, y2):
+        self._push_undo()
+        self._append_shape({'type': 'centerline', 'params': (x1, y1, x2, y2)})
+        self._last_centerline_index = len(self.shapes) - 1
         self.update()
 
     def add_circle(self, cx, cy, radius):
@@ -837,6 +885,15 @@ class Canvas(QWidget):
                 radius * factor,
                 start_angle,
                 span_angle,
+            )
+        elif shape_type == 'text':
+            x, y, text, height, rotation = params
+            shape['params'] = (
+                self._scale_value(x, anchor_x, factor),
+                self._scale_value(y, anchor_y, factor),
+                text,
+                height * factor if height else height,
+                rotation,
             )
 
     def _apply_zoom(self, factor, anchor):
@@ -1580,6 +1637,9 @@ class Canvas(QWidget):
         elif shape_type == 'center_mark':
             cx, cy, size = params
             shape['params'] = (cx + dx, cy + dy, size)
+        elif shape_type == 'text':
+            x, y, text, height, rotation = params
+            shape['params'] = (x + dx, y + dy, text, height, rotation)
 
     def _rotate_point(self, x, y, cx, cy, angle_deg):
         angle = math.radians(angle_deg)
@@ -2295,6 +2355,17 @@ class Canvas(QWidget):
         if shape_type in ('arc_angle', 'doubleline_arc', 'center_arc'):
             cx, cy, radius, start_angle, span_angle = shape['params']
             return self._arc_bounds(cx, cy, radius, start_angle, span_angle)
+        if shape_type == 'text':
+            x, y, text, height, rotation = shape['params']
+            if not text:
+                return None
+            size = float(height) if height and height > 0 else 12.0 * max(0.1, self.zoom_factor)
+            size = max(0.2, size)
+            lines = str(text).splitlines() or [str(text)]
+            max_len = max((len(line) for line in lines), default=1)
+            width = max_len * size * 0.6
+            total_height = size * len(lines)
+            return x, y - total_height, x + width, y
         return None
 
     def _indices_in_rect(self, rect_bounds, require_containment=False):
@@ -2336,6 +2407,13 @@ class Canvas(QWidget):
                 cx, cy, size = shape['params']
                 half = size / 2.0
                 if abs(pos.x() - cx) <= half + tol and abs(pos.y() - cy) <= half + tol:
+                    return index
+            elif shape['type'] == 'text':
+                bounds = self._shape_bounds(shape)
+                if bounds is None:
+                    continue
+                x1, y1, x2, y2 = bounds
+                if x1 - tol <= pos.x() <= x2 + tol and y1 - tol <= pos.y() <= y2 + tol:
                     return index
             elif shape['type'] == 'rect':
                 x1, y1, x2, y2 = shape['params']

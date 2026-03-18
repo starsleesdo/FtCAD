@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
 from canvas import Canvas
 from commands import CommandProcessor
 from modes import ModeState
+from heat_exchanger_data import load_upcomer_pdf_data, resolve_inner_cylinder_spec, summarize_extraction
 from ui_tabs import ALL_TABS, RibbonTabConfig
 
 
@@ -124,6 +125,11 @@ TOOL_TIPS = {
     "Plot": "打印输出: 设置图纸输出",
     "Export": "导出: 输出为其他格式",
     "Print": "打印: 提交打印任务",
+    "1内筒体组件": "1内筒体组件: 绘制上升管换热器内筒体组件",
+    "2内筒体": "2内筒体: 绘制内筒体",
+    "3 下接环组件": "3 下接环组件: 绘制下接环组件",
+    "3-1 下连接圈": "3-1 下连接圈: 绘制下连接圈",
+    "3-2下连接环": "3-2下连接环: 绘制下连接环",
 }
 
 TOOL_MENUS = {
@@ -713,6 +719,66 @@ class TableInsertDialog(QDialog):
         }
 
 
+class InnerCylinderParamsDialog(QDialog):
+    def __init__(self, params, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("内筒体参数设置")
+        self.resize(760, 520)
+        self.params = params
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "读取 project/1内筒体组件.dxf 的尺寸参数，修改后将写入 project_new/1内筒体组件.dxf。"
+            "标注文本含 <> 的行，请在新值中仅填写数字。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.table = QTableWidget(len(params), 4)
+        self.table.setHorizontalHeaderLabels(["序号", "标注文本", "当前值", "新值"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(
+            QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked | QAbstractItemView.EditKeyPressed
+        )
+
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+
+        for row, param in enumerate(params):
+            idx_item = QTableWidgetItem(str(row + 1))
+            idx_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.table.setItem(row, 0, idx_item)
+
+            text_item = QTableWidgetItem(param.get("text_display", ""))
+            text_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.table.setItem(row, 1, text_item)
+
+            current_item = QTableWidgetItem(param.get("current", ""))
+            current_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.table.setItem(row, 2, current_item)
+
+            new_item = QTableWidgetItem(param.get("current", ""))
+            self.table.setItem(row, 3, new_item)
+
+        layout.addWidget(self.table)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self):
+        values = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 3)
+            values.append(item.text().strip() if item is not None else "")
+        return values
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -757,8 +823,10 @@ class MainWindow(QMainWindow):
         self.layer_table = None
         self._layer_table_updating = False
         self._syncing_layer_ui = False
+        self.upcomer_pdf_data = None
 
         self._build_option_actions()
+        self._load_upcomer_pdf_data()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -879,6 +947,13 @@ class MainWindow(QMainWindow):
             action.triggered.connect(lambda checked=False, value=label: self._apply_theme(value))
             self.theme_action_group.addAction(action)
 
+    def _load_upcomer_pdf_data(self):
+        base_dir = os.path.dirname(__file__)
+        try:
+            self.upcomer_pdf_data = load_upcomer_pdf_data(base_dir)
+        except Exception:
+            self.upcomer_pdf_data = None
+
     def _build_menu_row(self):
         widget = QWidget()
         layout = QHBoxLayout(widget)
@@ -960,13 +1035,16 @@ class MainWindow(QMainWindow):
         page_layout = QHBoxLayout(page)
         page_layout.setContentsMargins(6, 2, 6, 2)
         page_layout.setSpacing(4)
+        text_buttons = tab_config.name == "方特上升管换热器"
         for section in tab_config.sections:
             if tab_config.name == "常规" and section.title == "图层":
                 page_layout.addWidget(self._make_layer_section(section.tools, section.title))
             elif tab_config.name == "常规" and section.title == "特性":
                 page_layout.addWidget(self._make_properties_section(section.title))
             else:
-                page_layout.addWidget(self._make_ribbon_section(section.tools, section.title))
+                page_layout.addWidget(
+                    self._make_ribbon_section(section.tools, section.title, text_buttons=text_buttons)
+                )
         page_layout.addStretch()
         return page
 
@@ -1008,7 +1086,7 @@ class MainWindow(QMainWindow):
         summary = "、".join(enabled) if enabled else "无"
         self.mode_label.setText(f"模式: {summary}")
 
-    def _make_ribbon_section(self, names, title_text):
+    def _make_ribbon_section(self, names, title_text, text_buttons=False):
         frame = QWidget()
         frame.setObjectName("ribbonSection")
         layout = QVBoxLayout(frame)
@@ -1023,7 +1101,7 @@ class MainWindow(QMainWindow):
         for index, name in enumerate(names):
             row = index % 3
             col = index // 3
-            grid.addWidget(self._icon_button(name), row, col)
+            grid.addWidget(self._icon_button(name, full_text=text_buttons), row, col)
         layout.addWidget(grid_widget)
 
         title = QLabel(title_text)
@@ -1130,20 +1208,32 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         return frame
 
-    def _icon_button(self, name):
+    def _icon_button(self, name, full_text=False):
         button = QToolButton()
-        button.setFixedSize(self.toolbar_button_size)
-        button.setIconSize(self.toolbar_icon_size)
         button.setToolTip(TOOL_TIPS.get(name, name))
 
         safe = "".join(ch for ch in name if ch.isalnum() or ch in (" ", "_")).lower().replace(" ", "_")
         icon_path = os.path.join(os.path.dirname(__file__), "icons", f"{safe}.svg")
         if os.path.exists(icon_path):
+            button.setFixedSize(self.toolbar_button_size)
+            button.setIconSize(self.toolbar_icon_size)
             button.setIcon(QIcon(icon_path))
             button.setToolButtonStyle(Qt.ToolButtonIconOnly)
         else:
-            button.setText(name[:2])
             button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+            if full_text:
+                button.setText(name)
+                button.setFixedHeight(self.toolbar_button_size.height())
+                text_width = button.fontMetrics().horizontalAdvance(name)
+                min_width = max(self.toolbar_button_size.width(), text_width + 16)
+                button.setMinimumWidth(min_width)
+                button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            else:
+                display = "".join(ch for ch in name if ch.isalnum())
+                if not display:
+                    display = name
+                button.setText(display[:2])
+                button.setFixedSize(self.toolbar_button_size)
 
         menu_config = TOOL_MENUS.get(name)
         if menu_config:
@@ -1757,8 +1847,9 @@ class MainWindow(QMainWindow):
 
     def _normalize_document_name(self, name):
         base_name = (name or 'Drawing').strip() or 'Drawing'
-        if not base_name.lower().endswith('.dwg'):
-            base_name = f'{base_name}.dwg'
+        lower_name = base_name.lower()
+        if not (lower_name.endswith('.dwg') or lower_name.endswith('.dxf')):
+            base_name = f'{base_name}.dxf'
         return base_name
 
     def _add_document(self, file_name, template_name, path=None, shapes=None):
@@ -1813,7 +1904,7 @@ class MainWindow(QMainWindow):
         self.output.append(f"新建图纸: {document['name']} | {template_name}")
 
     def _open_file(self):
-        filters = "FTCAD JSON (*.json);;AutoCAD DXF (*.dxf);;所有文件 (*.*)"
+        filters = "AutoCAD DXF (*.dxf)"
         path, selected_filter = QFileDialog.getOpenFileName(self, "打开图纸", "", filters)
         if not path:
             return
@@ -1830,6 +1921,7 @@ class MainWindow(QMainWindow):
         template_name = payload.get("template", "二维草图")
         shapes = payload.get("shapes", [])
         document = self._add_document(name, template_name, path=path, shapes=shapes)
+        self._fit_canvas_on_shapes(document["canvas"])
         self.output.append(f"已打开: {path}")
         self.status_label.setText(f"当前图纸: {document['name']}")
 
@@ -1838,7 +1930,7 @@ class MainWindow(QMainWindow):
         extension = os.path.splitext(path)[1].lower()
         if "dxf" in selected or extension == ".dxf":
             return self._load_dxf_document(path)
-        return self._load_json_document(path)
+        raise ValueError("仅支持 DXF 文件")
 
     def _load_json_document(self, path):
         with open(path, "r", encoding="utf-8") as handle:
@@ -1848,21 +1940,23 @@ class MainWindow(QMainWindow):
         return data
 
     def _load_dxf_document(self, path):
-        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            raw_lines = [line.rstrip("\r\n") for line in handle]
-        if len(raw_lines) < 2:
+        cleaned_lines, _ = self._read_dxf_lines(path)
+        if len(cleaned_lines) < 2:
             raise ValueError("DXF 内容为空")
 
         pairs = []
         index = 0
-        while index + 1 < len(raw_lines):
-            code = raw_lines[index].strip()
-            value = raw_lines[index + 1].strip()
+        while index + 1 < len(cleaned_lines):
+            code = cleaned_lines[index].strip()
+            value = cleaned_lines[index + 1].strip()
             pairs.append((code, value))
             index += 2
 
         shapes = []
         arcs = []
+        blocks = {}
+        layer_styles = {}
+        text_styles = {}
         section = None
         idx = 0
         total = len(pairs)
@@ -1878,32 +1972,357 @@ class MainWindow(QMainWindow):
                 section = None
                 idx += 1
                 continue
+            if section == "TABLES" and code == "0" and value.upper() == "TABLE":
+                if idx + 1 < total and pairs[idx + 1][0] == "2":
+                    table_name = pairs[idx + 1][1].upper()
+                    if table_name == "LAYER":
+                        idx = self._parse_dxf_layer_table(pairs, idx, layer_styles)
+                        continue
+                    if table_name == "STYLE":
+                        idx = self._parse_dxf_style_table(pairs, idx, text_styles)
+                        continue
+            if section == "BLOCKS" and code == "0" and value.upper() == "BLOCK":
+                idx = self._parse_dxf_block(pairs, idx, blocks, layer_styles, text_styles)
+                continue
             if section == "ENTITIES" and code == "0":
                 entity = value.upper()
+                layer_name, style = self._extract_entity_style(pairs, idx, layer_styles)
+                if entity == "INSERT":
+                    idx = self._parse_dxf_insert(pairs, idx, shapes, blocks, style, layer_name)
+                    continue
+                if entity == "DIMENSION":
+                    idx = self._parse_dxf_dimension(pairs, idx, shapes, blocks, style, layer_name)
+                    continue
                 if entity == "LINE":
-                    idx = self._parse_dxf_line(pairs, idx, shapes)
+                    idx = self._parse_dxf_line(pairs, idx, shapes, style, layer_name)
                     continue
                 if entity == "CIRCLE":
-                    idx = self._parse_dxf_circle(pairs, idx, shapes)
+                    idx = self._parse_dxf_circle(pairs, idx, shapes, style, layer_name)
                     continue
                 if entity == "ARC":
-                    idx = self._parse_dxf_arc(pairs, idx, arcs)
+                    idx = self._parse_dxf_arc(pairs, idx, arcs, style, layer_name)
+                    continue
+                if entity == "ELLIPSE":
+                    idx = self._parse_dxf_ellipse(pairs, idx, shapes, style, layer_name)
                     continue
                 if entity == "LWPOLYLINE":
-                    idx = self._parse_dxf_polyline(pairs, idx, shapes)
+                    idx = self._parse_dxf_polyline(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "POLYLINE":
+                    idx = self._parse_dxf_polyline_legacy(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "SPLINE":
+                    idx = self._parse_dxf_spline(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "TEXT":
+                    idx = self._parse_dxf_text(pairs, idx, shapes, style, layer_name, text_styles)
+                    continue
+                if entity == "MTEXT":
+                    idx = self._parse_dxf_mtext(pairs, idx, shapes, style, layer_name, text_styles)
+                    continue
+                if entity == "ATTRIB":
+                    idx = self._parse_dxf_text(pairs, idx, shapes, style, layer_name, text_styles)
+                    continue
+                if entity == "ATTDEF":
+                    idx = self._parse_dxf_text(pairs, idx, shapes, style, layer_name, text_styles)
+                    continue
+                if entity == "LEADER":
+                    idx = self._parse_dxf_leader(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "SOLID":
+                    idx = self._parse_dxf_solid(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "HATCH":
+                    idx = self._parse_dxf_hatch(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "HATCH":
+                    idx = self._parse_dxf_hatch(pairs, idx, shapes, style, layer_name)
                     continue
             idx += 1
 
         shapes.extend(self._convert_dxf_arcs(arcs))
         if not shapes:
-            raise ValueError("未在 DXF 中解析到已支持的图元 (LINE / CIRCLE / ARC / LWPOLYLINE)")
+            raise ValueError(
+                "未在 DXF 中解析到已支持的图元 "
+                "(LINE / CIRCLE / ARC / LWPOLYLINE / POLYLINE / INSERT / DIMENSION / TEXT / "
+                "SPLINE / ELLIPSE / LEADER / SOLID / HATCH)"
+            )
         return {
             "name": os.path.splitext(os.path.basename(path))[0],
             "template": "二维草图",
             "shapes": shapes,
         }
 
-    def _parse_dxf_line(self, pairs, start_index, shapes):
+    def _read_dxf_lines(self, path):
+        with open(path, "r", encoding="utf-8", errors="ignore", newline="") as handle:
+            raw_lines = handle.readlines()
+        cleaned = [line.rstrip("\r\n") for line in raw_lines]
+        return cleaned, raw_lines
+
+    def _safe_int(self, value):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    def _aci_color_to_hex(self, index):
+        mapping = {
+            1: "#ff0000",
+            2: "#ffff00",
+            3: "#00ff00",
+            4: "#00ffff",
+            5: "#0000ff",
+            6: "#ff00ff",
+            7: "#ffffff",
+            8: "#808080",
+            9: "#c0c0c0",
+        }
+        return mapping.get(index)
+
+    def _truecolor_to_hex(self, value):
+        number = self._safe_int(value)
+        if number is None:
+            return None
+        r = (number >> 16) & 0xFF
+        g = (number >> 8) & 0xFF
+        b = number & 0xFF
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _layer_style_from_entry(self, entry):
+        if not entry:
+            return None
+        style = {}
+        if entry.get("true_color") is not None:
+            color = self._truecolor_to_hex(entry.get("true_color"))
+            if color:
+                style["color"] = color
+        else:
+            idx = entry.get("color_index")
+            if idx is not None and idx not in (0, 256):
+                color = self._aci_color_to_hex(abs(idx))
+                if color:
+                    style["color"] = color
+        linetype = entry.get("linetype")
+        if linetype:
+            style["linetype"] = linetype
+        lineweight = entry.get("lineweight")
+        if lineweight is not None:
+            lw = self._safe_int(lineweight)
+            if lw is not None and lw > 0:
+                style["lineweight"] = f"{lw / 100.0:.2f}"
+        return style or None
+
+    def _parse_dxf_layer_table(self, pairs, start_index, layer_styles):
+        idx = start_index + 1
+        total = len(pairs)
+        current = None
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0" and value.upper() == "ENDTAB":
+                if current and current.get("name"):
+                    layer_styles[current["name"]] = self._layer_style_from_entry(current) or {}
+                idx += 1
+                break
+            if code == "0" and value.upper() == "LAYER":
+                if current and current.get("name"):
+                    layer_styles[current["name"]] = self._layer_style_from_entry(current) or {}
+                current = {}
+                idx += 1
+                continue
+            if current is not None:
+                if code == "2":
+                    current["name"] = value
+                elif code == "62":
+                    current["color_index"] = self._safe_int(value)
+                elif code == "420":
+                    current["true_color"] = self._safe_int(value)
+                elif code == "6":
+                    current["linetype"] = value
+                elif code == "370":
+                    current["lineweight"] = value
+            idx += 1
+        return idx
+
+    def _parse_dxf_style_table(self, pairs, start_index, text_styles):
+        idx = start_index + 1
+        total = len(pairs)
+        current = None
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0" and value.upper() == "ENDTAB":
+                if current and current.get("name"):
+                    height = current.get("height")
+                    if height is not None and height > 0:
+                        text_styles[current["name"]] = height
+                idx += 1
+                break
+            if code == "0" and value.upper() == "STYLE":
+                if current and current.get("name"):
+                    height = current.get("height")
+                    if height is not None and height > 0:
+                        text_styles[current["name"]] = height
+                current = {}
+                idx += 1
+                continue
+            if current is not None:
+                if code == "2":
+                    current["name"] = value
+                elif code == "40":
+                    current["height"] = self._parse_float(value)
+            idx += 1
+        return idx
+
+    def _extract_entity_style(self, pairs, start_index, layer_styles):
+        idx = start_index + 1
+        total = len(pairs)
+        layer_name = None
+        color_index = None
+        true_color = None
+        linetype = None
+        lineweight = None
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "8":
+                layer_name = value
+            elif code == "62":
+                color_index = self._safe_int(value)
+            elif code == "420":
+                true_color = self._safe_int(value)
+            elif code == "6":
+                linetype = value
+            elif code == "370":
+                lineweight = self._safe_int(value)
+            idx += 1
+
+        style = {}
+        base = layer_styles.get(layer_name)
+        if base:
+            style.update(base)
+        if true_color is not None:
+            color = self._truecolor_to_hex(true_color)
+            if color:
+                style["color"] = color
+        elif color_index is not None and color_index not in (0, 256):
+            color = self._aci_color_to_hex(abs(color_index))
+            if color:
+                style["color"] = color
+        if linetype:
+            style["linetype"] = linetype
+        if lineweight is not None and lineweight > 0:
+            style["lineweight"] = f"{lineweight / 100.0:.2f}"
+        return layer_name, style or None
+
+    def _merge_styles(self, base, override):
+        if not base and not override:
+            return None
+        merged = dict(base) if base else {}
+        if override:
+            for key, value in override.items():
+                if value is not None:
+                    merged[key] = value
+        return merged or None
+
+    def _extract_dxf_dimension_params(self, path):
+        cleaned, raw_lines = self._read_dxf_lines(path)
+        if len(cleaned) < 2:
+            raise ValueError("DXF 内容为空")
+
+        entries = []
+        section = None
+        idx = 0
+        total = len(cleaned)
+        while idx + 1 < total:
+            code = cleaned[idx].strip()
+            value = cleaned[idx + 1].strip()
+            if code == "0" and value == "SECTION":
+                if idx + 3 < total and cleaned[idx + 2].strip() == "2":
+                    section = cleaned[idx + 3].strip()
+                idx += 2
+                continue
+            if code == "0" and value == "ENDSEC":
+                section = None
+                idx += 2
+                continue
+            if section == "ENTITIES" and code == "0" and value.upper() == "DIMENSION":
+                text_value = None
+                text_index = None
+                meas_value = None
+                meas_index = None
+                j = idx + 2
+                while j + 1 < total:
+                    c = cleaned[j].strip()
+                    v = cleaned[j + 1].strip()
+                    if c == "0":
+                        break
+                    if c == "1" and text_value is None:
+                        text_value = v
+                        text_index = j + 1
+                    elif c == "42" and meas_value is None:
+                        meas_value = v
+                        meas_index = j + 1
+                    j += 2
+                text_value = text_value or ""
+                use_measure = (not text_value) or ("<>" in text_value)
+                current = meas_value if use_measure else text_value
+                text_display = text_value if text_value else "<>"
+                entries.append(
+                    {
+                        "text": text_value,
+                        "text_display": text_display,
+                        "text_index": text_index,
+                        "measurement": meas_value,
+                        "measurement_index": meas_index,
+                        "use_measure": use_measure,
+                        "current": current or "",
+                    }
+                )
+                idx = j
+                continue
+            idx += 2
+        return raw_lines, entries
+
+    def _replace_dxf_value_line(self, raw_lines, index, value):
+        if index is None or index < 0 or index >= len(raw_lines):
+            return
+        line = raw_lines[index]
+        if line.endswith("\r\n"):
+            newline = "\r\n"
+        elif line.endswith("\n"):
+            newline = "\n"
+        else:
+            newline = ""
+        raw_lines[index] = f"{value}{newline}"
+
+    def _apply_dimension_updates(self, raw_lines, entries, new_values):
+        for idx, (entry, new_value) in enumerate(zip(entries, new_values), start=1):
+            value = (new_value or "").strip()
+            if not value:
+                continue
+            if entry["use_measure"]:
+                number = self._parse_float(value)
+                if number is None:
+                    raise ValueError(f"第 {idx} 行参数需要输入数字。")
+                if entry["measurement_index"] is None:
+                    raise ValueError(f"第 {idx} 行缺少测量值，无法写入。")
+                self._replace_dxf_value_line(raw_lines, entry["measurement_index"], value)
+                if entry["text_index"] is not None and "<>" in (entry.get("text") or ""):
+                    replaced = entry["text"].replace("<>", value)
+                    self._replace_dxf_value_line(raw_lines, entry["text_index"], replaced)
+            else:
+                if entry["text_index"] is not None:
+                    self._replace_dxf_value_line(raw_lines, entry["text_index"], value)
+                elif entry["measurement_index"] is not None:
+                    number = self._parse_float(value)
+                    if number is None:
+                        raise ValueError(f"第 {idx} 行参数需要输入数字。")
+                    self._replace_dxf_value_line(raw_lines, entry["measurement_index"], value)
+                number = self._parse_float(value)
+                if number is not None and entry["measurement_index"] is not None:
+                    self._replace_dxf_value_line(raw_lines, entry["measurement_index"], value)
+
+    def _parse_dxf_line(self, pairs, start_index, shapes, style=None, layer=None):
         idx = start_index + 1
         x1 = y1 = x2 = y2 = None
         total = len(pairs)
@@ -1925,10 +2344,15 @@ class MainWindow(QMainWindow):
                 y2 = -number
             idx += 1
         if None not in (x1, y1, x2, y2):
-            shapes.append({"type": "line", "params": (x1, y1, x2, y2)})
+            shape = {"type": "line", "params": (x1, y1, x2, y2)}
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
         return idx
 
-    def _parse_dxf_circle(self, pairs, start_index, shapes):
+    def _parse_dxf_circle(self, pairs, start_index, shapes, style=None, layer=None):
         idx = start_index + 1
         cx = cy = radius = None
         total = len(pairs)
@@ -1948,10 +2372,15 @@ class MainWindow(QMainWindow):
                 radius = abs(number)
             idx += 1
         if None not in (cx, cy, radius):
-            shapes.append({"type": "circle", "params": (cx, cy, radius)})
+            shape = {"type": "circle", "params": (cx, cy, radius)}
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
         return idx
 
-    def _parse_dxf_arc(self, pairs, start_index, arcs):
+    def _parse_dxf_arc(self, pairs, start_index, arcs, style=None, layer=None):
         idx = start_index + 1
         cx = cy = radius = start_angle = end_angle = None
         total = len(pairs)
@@ -1975,15 +2404,359 @@ class MainWindow(QMainWindow):
                 end_angle = number
             idx += 1
         if None not in (cx, cy, radius, start_angle, end_angle):
-            arcs.append({"cx": cx, "cy": cy, "radius": radius, "start": start_angle, "end": end_angle})
+            arc = {
+                "cx": cx,
+                "cy": cy,
+                "radius": radius,
+                "start": start_angle,
+                "end": end_angle,
+            }
+            if layer:
+                arc["layer"] = layer
+            if style:
+                arc["style"] = dict(style)
+            arcs.append(arc)
         return idx
 
-    def _parse_dxf_polyline(self, pairs, start_index, shapes):
+    def _bulge_arc_points(self, p1, p2, bulge):
+        if abs(bulge) < 1e-6:
+            return [p1, p2]
+        x1, y1 = p1
+        x2, y2 = p2
+        dx = x2 - x1
+        dy = y2 - y1
+        chord = math.hypot(dx, dy)
+        if chord < 1e-6:
+            return [p1, p2]
+        theta = 4 * math.atan(bulge)
+        radius = chord / (2 * math.sin(theta / 2.0))
+        mx = (x1 + x2) / 2.0
+        my = (y1 + y2) / 2.0
+        ux = -dy / chord
+        uy = dx / chord
+        h = radius * math.cos(theta / 2.0)
+        if bulge < 0:
+            h = -h
+        cx = mx + ux * h
+        cy = my + uy * h
+        start_angle = math.atan2(y1 - cy, x1 - cx)
+        end_angle = math.atan2(y2 - cy, x2 - cx)
+        if bulge > 0 and end_angle <= start_angle:
+            end_angle += math.tau
+        if bulge < 0 and end_angle >= start_angle:
+            end_angle -= math.tau
+        span = end_angle - start_angle
+        steps = max(6, int(abs(span) / (math.pi / 12.0)))
+        points = []
+        for i in range(steps + 1):
+            angle = start_angle + span * (i / steps)
+            points.append((cx + math.cos(angle) * radius, cy + math.sin(angle) * radius))
+        return points
+
+    def _bulge_vertices_to_points(self, vertices, closed):
+        if not vertices:
+            return []
+        if closed and len(vertices) > 1:
+            vertices = list(vertices) + [vertices[0]]
+        output = []
+        for index in range(len(vertices) - 1):
+            p1 = vertices[index]
+            p2 = vertices[index + 1]
+            if not output:
+                output.append((p1["x"], p1["y"]))
+            bulge = p1.get("bulge", 0.0) or 0.0
+            if abs(bulge) < 1e-6:
+                output.append((p2["x"], p2["y"]))
+            else:
+                arc_pts = self._bulge_arc_points((p1["x"], p1["y"]), (p2["x"], p2["y"]), bulge)
+                output.extend(arc_pts[1:])
+        return output
+
+    def _parse_dxf_polyline(self, pairs, start_index, shapes, style=None, layer=None):
+        idx = start_index + 1
+        total = len(pairs)
+        vertices = []
+        pending_x = None
+        pending_bulge = 0.0
+        last_index = None
+        closed = False
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "10":
+                pending_x = self._parse_float(value)
+            elif code == "20":
+                if pending_x is not None:
+                    y_val = self._parse_float(value)
+                    if y_val is not None:
+                        vertices.append({"x": pending_x, "y": -y_val, "bulge": pending_bulge})
+                        last_index = len(vertices) - 1
+                pending_x = None
+                pending_bulge = 0.0
+            elif code == "42":
+                bulge_val = self._parse_float(value) or 0.0
+                if last_index is not None and pending_x is None:
+                    vertices[last_index]["bulge"] = bulge_val
+                else:
+                    pending_bulge = bulge_val
+            elif code == "70":
+                try:
+                    closed = (int(float(value)) & 1) == 1
+                except ValueError:
+                    closed = False
+            idx += 1
+        points = self._bulge_vertices_to_points(vertices, closed)
+        if len(points) >= 2:
+            shape = {"type": "polyline", "params": (tuple(points), False)}
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
+        return idx
+
+    def _parse_dxf_polyline_legacy(self, pairs, start_index, shapes, style=None, layer=None):
+        idx = start_index + 1
+        total = len(pairs)
+        closed = False
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "70":
+                try:
+                    closed = (int(float(value)) & 1) == 1
+                except ValueError:
+                    closed = False
+            idx += 1
+
+        vertices = []
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0" and value.upper() == "VERTEX":
+                idx += 1
+                vx = vy = None
+                bulge = 0.0
+                while idx < total:
+                    c, v = pairs[idx]
+                    if c == "0":
+                        break
+                    if c == "10":
+                        vx = self._parse_float(v)
+                    elif c == "20":
+                        vy = self._parse_float(v)
+                    elif c == "42":
+                        bulge = self._parse_float(v) or 0.0
+                    idx += 1
+                if vx is not None and vy is not None:
+                    vertices.append({"x": vx, "y": -vy, "bulge": bulge})
+                continue
+            if code == "0" and value.upper() == "SEQEND":
+                idx += 1
+                break
+            if code == "0":
+                break
+            idx += 1
+
+        points = self._bulge_vertices_to_points(vertices, closed)
+        if len(points) >= 2:
+            shape = {"type": "polyline", "params": (tuple(points), False)}
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
+        return idx
+
+    def _parse_dxf_spline(self, pairs, start_index, shapes, style=None, layer=None):
+        idx = start_index + 1
+        total = len(pairs)
+        ctrl_points = []
+        fit_points = []
+        pending_ctrl_x = None
+        pending_fit_x = None
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "10":
+                pending_ctrl_x = self._parse_float(value)
+            elif code == "20":
+                if pending_ctrl_x is not None:
+                    y_val = self._parse_float(value)
+                    if y_val is not None:
+                        ctrl_points.append((pending_ctrl_x, -y_val))
+                pending_ctrl_x = None
+            elif code == "11":
+                pending_fit_x = self._parse_float(value)
+            elif code == "21":
+                if pending_fit_x is not None:
+                    y_val = self._parse_float(value)
+                    if y_val is not None:
+                        fit_points.append((pending_fit_x, -y_val))
+                pending_fit_x = None
+            idx += 1
+
+        points = fit_points if len(fit_points) >= 2 else ctrl_points
+        if len(points) >= 2:
+            shape = {"type": "polyline", "params": (tuple(points), False)}
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
+        return idx
+
+    def _parse_dxf_ellipse(self, pairs, start_index, shapes, style=None, layer=None):
+        idx = start_index + 1
+        total = len(pairs)
+        cx = cy = None
+        major_dx = major_dy = None
+        ratio = None
+        start_param = 0.0
+        end_param = 0.0
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "10":
+                cx = self._parse_float(value)
+            elif code == "20":
+                cy = self._parse_float(value)
+            elif code == "11":
+                major_dx = self._parse_float(value)
+            elif code == "21":
+                major_dy = self._parse_float(value)
+            elif code == "40":
+                ratio = self._parse_float(value)
+            elif code == "41":
+                start_param = self._parse_float(value) or 0.0
+            elif code == "42":
+                end_param = self._parse_float(value) or 0.0
+            idx += 1
+
+        if None in (cx, cy, major_dx, major_dy, ratio):
+            return idx
+
+        cy = -cy
+        major_vec = (major_dx, -major_dy)
+        minor_vec = (-major_vec[1] * ratio, major_vec[0] * ratio)
+        span = end_param - start_param
+        if span <= 0:
+            span += math.tau
+        steps = max(12, int(abs(span) / (math.tau / 48)))
+        points = []
+        for i in range(steps + 1):
+            t = start_param + span * (i / steps)
+            x = cx + major_vec[0] * math.cos(t) + minor_vec[0] * math.sin(t)
+            y = cy + major_vec[1] * math.cos(t) + minor_vec[1] * math.sin(t)
+            points.append((x, y))
+        if len(points) >= 2:
+            shape = {"type": "polyline", "params": (tuple(points), False)}
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
+        return idx
+
+    def _parse_dxf_text(self, pairs, start_index, shapes, style=None, layer=None, text_styles=None):
+        idx = start_index + 1
+        total = len(pairs)
+        x = y = None
+        height = None
+        rotation = 0.0
+        text_value = ""
+        style_name = None
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "10":
+                x = self._parse_float(value)
+            elif code == "20":
+                y = self._parse_float(value)
+            elif code == "1":
+                text_value = value
+            elif code == "40":
+                height = self._parse_float(value)
+            elif code == "50":
+                rotation = self._parse_float(value) or 0.0
+            elif code == "7":
+                style_name = value
+            idx += 1
+
+        if x is None or y is None or text_value is None:
+            return idx
+        if (height is None or height <= 0) and text_styles and style_name:
+            height = text_styles.get(style_name, height)
+        shape = {
+            "type": "text",
+            "params": (x, -y, text_value, height, -rotation),
+        }
+        if layer:
+            shape["layer"] = layer
+        if style:
+            shape["style"] = dict(style)
+        shapes.append(shape)
+        return idx
+
+    def _clean_mtext(self, text):
+        if not text:
+            return ""
+        cleaned = text.replace("\\P", "\n").replace("\\~", " ")
+        if "{" in cleaned and "}" in cleaned:
+            cleaned = cleaned.replace("{", "").replace("}", "")
+        return cleaned
+
+    def _parse_dxf_mtext(self, pairs, start_index, shapes, style=None, layer=None, text_styles=None):
+        idx = start_index + 1
+        total = len(pairs)
+        x = y = None
+        height = None
+        rotation = 0.0
+        parts = []
+        style_name = None
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "10":
+                x = self._parse_float(value)
+            elif code == "20":
+                y = self._parse_float(value)
+            elif code in ("1", "3"):
+                parts.append(value)
+            elif code == "40":
+                height = self._parse_float(value)
+            elif code == "50":
+                rotation = self._parse_float(value) or 0.0
+            elif code == "7":
+                style_name = value
+            idx += 1
+
+        if x is None or y is None or not parts:
+            return idx
+        text_value = self._clean_mtext("".join(parts))
+        if (height is None or height <= 0) and text_styles and style_name:
+            height = text_styles.get(style_name, height)
+        shape = {
+            "type": "text",
+            "params": (x, -y, text_value, height, -rotation),
+        }
+        if layer:
+            shape["layer"] = layer
+        if style:
+            shape["style"] = dict(style)
+        shapes.append(shape)
+        return idx
+
+    def _parse_dxf_leader(self, pairs, start_index, shapes, style=None, layer=None):
         idx = start_index + 1
         total = len(pairs)
         points = []
         pending_x = None
-        closed = False
         while idx < total:
             code, value = pairs[idx]
             if code == "0":
@@ -1996,18 +2769,501 @@ class MainWindow(QMainWindow):
                     if y_val is not None:
                         points.append((pending_x, -y_val))
                 pending_x = None
-            elif code == "70":
-                try:
-                    closed = (int(float(value)) & 1) == 1
-                except ValueError:
-                    closed = False
             idx += 1
-        if closed and points and points[0] != points[-1]:
-            points.append(points[0])
         if len(points) >= 2:
-            for start, end in zip(points, points[1:]):
-                shapes.append({"type": "line", "params": (start[0], start[1], end[0], end[1])})
+            shape = {"type": "polyline", "params": (tuple(points), False)}
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
         return idx
+
+    def _parse_dxf_solid(self, pairs, start_index, shapes, style=None, layer=None):
+        idx = start_index + 1
+        total = len(pairs)
+        coords = {"10": None, "20": None, "11": None, "21": None, "12": None, "22": None, "13": None, "23": None}
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code in coords:
+                coords[code] = self._parse_float(value)
+            idx += 1
+        points = []
+        for x_code, y_code in (("10", "20"), ("11", "21"), ("12", "22"), ("13", "23")):
+            x_val = coords.get(x_code)
+            y_val = coords.get(y_code)
+            if x_val is not None and y_val is not None:
+                points.append((x_val, -y_val))
+        if len(points) >= 3:
+            shape = {"type": "polyline", "params": (tuple(points), True)}
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
+        return idx
+
+    def _parse_dxf_hatch(self, pairs, start_index, shapes, style=None, layer=None):
+        idx = start_index + 1
+        total = len(pairs)
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "92":
+                try:
+                    path_type = int(float(value))
+                except ValueError:
+                    path_type = 0
+                if path_type & 2:
+                    has_bulge = False
+                    closed = False
+                    num_vertices = 0
+                    idx += 1
+                    while idx < total:
+                        code2, value2 = pairs[idx]
+                        if code2 == "0" or code2 == "92":
+                            idx -= 1
+                            break
+                        if code2 == "72":
+                            has_bulge = value2.strip() == "1"
+                        elif code2 == "73":
+                            closed = value2.strip() == "1"
+                        elif code2 == "93":
+                            try:
+                                num_vertices = int(float(value2))
+                            except ValueError:
+                                num_vertices = 0
+                            idx += 1
+                            break
+                        idx += 1
+                    vertices = []
+                    count = 0
+                    pending_x = None
+                    pending_bulge = 0.0
+                    while idx < total and count < num_vertices:
+                        code3, value3 = pairs[idx]
+                        if code3 == "0":
+                            idx -= 1
+                            break
+                        if code3 == "10":
+                            pending_x = self._parse_float(value3)
+                        elif code3 == "20":
+                            if pending_x is not None:
+                                y_val = self._parse_float(value3)
+                                if y_val is not None:
+                                    vertices.append({"x": pending_x, "y": -y_val, "bulge": pending_bulge})
+                                    count += 1
+                            pending_x = None
+                            pending_bulge = 0.0
+                        elif code3 == "42" and has_bulge:
+                            pending_bulge = self._parse_float(value3) or 0.0
+                        idx += 1
+                    points = self._bulge_vertices_to_points(vertices, closed)
+                    if len(points) >= 2:
+                        shape = {"type": "polyline", "params": (tuple(points), False)}
+                        if layer:
+                            shape["layer"] = layer
+                        if style:
+                            shape["style"] = dict(style)
+                        shapes.append(shape)
+            idx += 1
+        return idx
+
+    def _block_bounds(self, block):
+        min_x = min_y = float("inf")
+        max_x = max_y = float("-inf")
+        has_any = False
+        for shape in block.get("shapes", []):
+            shape_type = shape.get("type")
+            params = shape.get("params", ())
+            if shape_type in ("line", "centerline"):
+                x1, y1, x2, y2 = params
+                points = [(x1, y1), (x2, y2)]
+            elif shape_type == "circle":
+                cx, cy, radius = params
+                points = [(cx - radius, cy - radius), (cx + radius, cy + radius)]
+            elif shape_type in ("arc_angle", "doubleline_arc", "center_arc"):
+                cx, cy, radius, _, _ = params
+                points = [(cx - radius, cy - radius), (cx + radius, cy + radius)]
+            elif shape_type == "polyline":
+                pts, _ = params
+                points = list(pts)
+            elif shape_type == "text":
+                x, y, *_ = params
+                points = [(x, y)]
+            elif shape_type in ("rect", "ellipse", "arc"):
+                x1, y1, x2, y2 = params
+                points = [(x1, y1), (x2, y2)]
+            elif shape_type == "doubleline":
+                x1, y1, x2, y2, width = params
+                pad = width / 2.0
+                points = [(x1 - pad, y1 - pad), (x2 + pad, y2 + pad)]
+            else:
+                continue
+            for px, py in points:
+                min_x = min(min_x, px)
+                min_y = min(min_y, py)
+                max_x = max(max_x, px)
+                max_y = max(max_y, py)
+                has_any = True
+        if not has_any:
+            return None
+        return min_x, min_y, max_x, max_y
+
+    def _parse_dxf_dimension(self, pairs, start_index, shapes, blocks, style=None, layer=None):
+        idx = start_index + 1
+        total = len(pairs)
+        block_name = None
+        def_x = def_y = None
+        text_x = text_y = None
+        rotation = 0.0
+        text_override = None
+        measurement = None
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "2":
+                block_name = value.strip()
+            elif code == "10":
+                def_x = self._parse_float(value)
+            elif code == "20":
+                def_y = self._parse_float(value)
+            elif code == "11":
+                text_x = self._parse_float(value)
+            elif code == "21":
+                text_y = self._parse_float(value)
+            elif code == "1":
+                text_override = value
+            elif code == "42":
+                measurement = value
+            elif code == "50":
+                rotation = self._parse_float(value) or 0.0
+            idx += 1
+
+        insert_point = None
+        if def_x is not None and def_y is not None:
+            insert_point = (def_x, -def_y)
+        if insert_point is None and text_x is not None and text_y is not None:
+            insert_point = (text_x, -text_y)
+
+        block_has_text = False
+        if block_name and block_name in blocks:
+            block = blocks[block_name]
+            block_has_text = any(shape.get("type") == "text" for shape in block.get("shapes", []))
+            use_absolute = False
+            if insert_point is not None:
+                bbox = self._block_bounds(block)
+                if bbox is not None:
+                    bx1, by1, bx2, by2 = bbox
+                    cx = (bx1 + bx2) / 2.0
+                    cy = (by1 + by2) / 2.0
+                    size = max(bx2 - bx1, by2 - by1, 1.0)
+                    distance = math.hypot(cx - insert_point[0], cy - insert_point[1])
+                    if distance <= size * 1.1:
+                        use_absolute = True
+            if use_absolute or insert_point is None:
+                self._append_block_shapes(
+                    shapes,
+                    block,
+                    (0.0, 0.0),
+                    1.0,
+                    1.0,
+                    0.0,
+                    override_style=style,
+                    override_layer=layer,
+                    absolute=True,
+                )
+            else:
+                self._append_block_shapes(
+                    shapes,
+                    block,
+                    insert_point,
+                    1.0,
+                    1.0,
+                    rotation,
+                    override_style=style,
+                    override_layer=layer,
+                )
+
+        display_text = text_override or ""
+        if (not display_text) or ("<>" in display_text):
+            if measurement:
+                display_text = display_text.replace("<>", measurement) if display_text else measurement
+        if display_text and text_x is not None and text_y is not None and not block_has_text:
+            shape = {
+                "type": "text",
+                "params": (text_x, -text_y, display_text, None, -rotation),
+            }
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
+        return idx
+
+    def _parse_dxf_block(self, pairs, start_index, blocks, layer_styles, text_styles):
+        idx = start_index + 1
+        total = len(pairs)
+        name = None
+        base_x = 0.0
+        base_y = 0.0
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "2":
+                name = value.strip()
+            elif code == "10":
+                base_x = self._parse_float(value) or base_x
+            elif code == "20":
+                base_y = self._parse_float(value) or base_y
+            idx += 1
+
+        shapes = []
+        arcs = []
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0" and value.upper() == "ENDBLK":
+                idx += 1
+                break
+            if code == "0":
+                entity = value.upper()
+                layer_name, style = self._extract_entity_style(pairs, idx, layer_styles)
+                if entity == "LINE":
+                    idx = self._parse_dxf_line(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "CIRCLE":
+                    idx = self._parse_dxf_circle(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "ARC":
+                    idx = self._parse_dxf_arc(pairs, idx, arcs, style, layer_name)
+                    continue
+                if entity == "ELLIPSE":
+                    idx = self._parse_dxf_ellipse(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "LWPOLYLINE":
+                    idx = self._parse_dxf_polyline(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "POLYLINE":
+                    idx = self._parse_dxf_polyline_legacy(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "SPLINE":
+                    idx = self._parse_dxf_spline(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "TEXT":
+                    idx = self._parse_dxf_text(pairs, idx, shapes, style, layer_name, text_styles)
+                    continue
+                if entity == "MTEXT":
+                    idx = self._parse_dxf_mtext(pairs, idx, shapes, style, layer_name, text_styles)
+                    continue
+                if entity == "ATTRIB":
+                    idx = self._parse_dxf_text(pairs, idx, shapes, style, layer_name, text_styles)
+                    continue
+                if entity == "ATTDEF":
+                    idx = self._parse_dxf_text(pairs, idx, shapes, style, layer_name, text_styles)
+                    continue
+                if entity == "INSERT":
+                    idx = self._parse_dxf_insert(pairs, idx, shapes, blocks, style, layer_name)
+                    continue
+                if entity == "LEADER":
+                    idx = self._parse_dxf_leader(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "SOLID":
+                    idx = self._parse_dxf_solid(pairs, idx, shapes, style, layer_name)
+                    continue
+                if entity == "HATCH":
+                    idx = self._parse_dxf_hatch(pairs, idx, shapes, style, layer_name)
+                    continue
+            idx += 1
+
+        shapes.extend(self._convert_dxf_arcs(arcs))
+        if name:
+            blocks[name] = {"base": (base_x, -base_y), "shapes": shapes}
+        return idx
+
+    def _parse_dxf_insert(self, pairs, start_index, shapes, blocks, style=None, layer=None):
+        idx = start_index + 1
+        total = len(pairs)
+        name = None
+        ins_x = 0.0
+        ins_y = 0.0
+        scale_x = 1.0
+        scale_y = 1.0
+        scale_x_set = False
+        scale_y_set = False
+        rotation = 0.0
+        while idx < total:
+            code, value = pairs[idx]
+            if code == "0":
+                break
+            if code == "2":
+                name = value.strip()
+            elif code == "10":
+                ins_x = self._parse_float(value) or ins_x
+            elif code == "20":
+                ins_y = self._parse_float(value) or ins_y
+            elif code == "41":
+                scale_x = self._parse_float(value) or scale_x
+                scale_x_set = True
+            elif code == "42":
+                scale_y = self._parse_float(value) or scale_y
+                scale_y_set = True
+            elif code == "50":
+                rotation = self._parse_float(value) or rotation
+            idx += 1
+
+        if scale_x_set and not scale_y_set:
+            scale_y = scale_x
+        elif scale_y_set and not scale_x_set:
+            scale_x = scale_y
+
+        block = blocks.get(name)
+        if block:
+            insert_point = (ins_x, -ins_y)
+            use_absolute = False
+            bbox = self._block_bounds(block)
+            if bbox is not None:
+                bx1, by1, bx2, by2 = bbox
+                cx = (bx1 + bx2) / 2.0
+                cy = (by1 + by2) / 2.0
+                size = max(bx2 - bx1, by2 - by1, 1.0)
+                distance = math.hypot(cx - insert_point[0], cy - insert_point[1])
+                if distance <= size * 1.1:
+                    use_absolute = True
+            if use_absolute:
+                self._append_block_shapes(
+                    shapes,
+                    block,
+                    (0.0, 0.0),
+                    1.0,
+                    1.0,
+                    0.0,
+                    override_style=style,
+                    override_layer=layer,
+                    absolute=True,
+                )
+            else:
+                self._append_block_shapes(
+                    shapes,
+                    block,
+                    insert_point=insert_point,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                    rotation=rotation,
+                    override_style=style,
+                    override_layer=layer,
+                )
+        return idx
+
+    def _append_block_shapes(
+        self,
+        shapes,
+        block,
+        insert_point,
+        scale_x=1.0,
+        scale_y=1.0,
+        rotation=0.0,
+        override_style=None,
+        override_layer=None,
+        absolute=False,
+    ):
+        base_x, base_y = block.get("base", (0.0, 0.0))
+        angle = math.radians(-rotation)
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        scale_factor = (abs(scale_x) + abs(scale_y)) / 2.0
+
+        if absolute:
+            for shape in block.get("shapes", []):
+                new_shape = dict(shape)
+                merged_style = self._merge_styles(shape.get("style"), override_style)
+                layer_name = shape.get("layer")
+                if override_layer and (not layer_name or layer_name == "0"):
+                    layer_name = override_layer
+                if merged_style:
+                    new_shape["style"] = merged_style
+                if layer_name:
+                    new_shape["layer"] = layer_name
+                shapes.append(new_shape)
+            return
+
+        def transform_point(x, y):
+            rx = (x - base_x) * scale_x
+            ry = (y - base_y) * scale_y
+            tx = rx * cos_a - ry * sin_a
+            ty = rx * sin_a + ry * cos_a
+            return (tx + insert_point[0], ty + insert_point[1])
+
+        for shape in block.get("shapes", []):
+            shape_type = shape.get("type")
+            params = shape.get("params", ())
+            merged_style = self._merge_styles(shape.get("style"), override_style)
+            layer_name = shape.get("layer")
+            if override_layer and (not layer_name or layer_name == "0"):
+                layer_name = override_layer
+            if shape_type in ("line", "centerline"):
+                x1, y1, x2, y2 = params
+                p1 = transform_point(x1, y1)
+                p2 = transform_point(x2, y2)
+                new_shape = dict(shape)
+                new_shape["params"] = (p1[0], p1[1], p2[0], p2[1])
+                if merged_style:
+                    new_shape["style"] = merged_style
+                if layer_name:
+                    new_shape["layer"] = layer_name
+                shapes.append(new_shape)
+            elif shape_type == "polyline":
+                points, closed = params
+                new_points = [transform_point(x, y) for x, y in points]
+                new_shape = dict(shape)
+                new_shape["params"] = (tuple(new_points), closed)
+                if merged_style:
+                    new_shape["style"] = merged_style
+                if layer_name:
+                    new_shape["layer"] = layer_name
+                shapes.append(new_shape)
+            elif shape_type == "circle":
+                cx, cy, radius = params
+                center = transform_point(cx, cy)
+                new_shape = dict(shape)
+                new_shape["params"] = (center[0], center[1], radius * scale_factor)
+                if merged_style:
+                    new_shape["style"] = merged_style
+                if layer_name:
+                    new_shape["layer"] = layer_name
+                shapes.append(new_shape)
+            elif shape_type in ("arc_angle", "doubleline_arc", "center_arc"):
+                cx, cy, radius, start_angle, span_angle = params
+                center = transform_point(cx, cy)
+                new_shape = dict(shape)
+                new_shape["params"] = (
+                    center[0],
+                    center[1],
+                    radius * scale_factor,
+                    start_angle - rotation,
+                    span_angle,
+                )
+                if merged_style:
+                    new_shape["style"] = merged_style
+                if layer_name:
+                    new_shape["layer"] = layer_name
+                shapes.append(new_shape)
+            elif shape_type == "text":
+                x, y, text_value, height, text_rotation = params
+                pos = transform_point(x, y)
+                new_height = height * scale_factor if height else height
+                new_rotation = (text_rotation or 0.0) - rotation
+                new_shape = dict(shape)
+                new_shape["params"] = (pos[0], pos[1], text_value, new_height, new_rotation)
+                if merged_style:
+                    new_shape["style"] = merged_style
+                if layer_name:
+                    new_shape["layer"] = layer_name
+                shapes.append(new_shape)
 
     def _convert_dxf_arcs(self, arcs):
         if not arcs:
@@ -2040,12 +3296,15 @@ class MainWindow(QMainWindow):
             span = self._angle_span(arc["start"], arc["end"])
             if arc.get("_group_size", 1) >= 2 and abs(span) > 180:
                 span = span - 360 if span > 0 else span + 360
-            shapes.append(
-                {
-                    "type": arc.get("kind", "doubleline_arc"),
-                    "params": (arc["cx"], arc["cy"], arc["radius"], arc["start"], span),
-                }
-            )
+            shape = {
+                "type": arc.get("kind", "doubleline_arc"),
+                "params": (arc["cx"], arc["cy"], arc["radius"], arc["start"], span),
+            }
+            if arc.get("layer"):
+                shape["layer"] = arc.get("layer")
+            if arc.get("style"):
+                shape["style"] = dict(arc.get("style"))
+            shapes.append(shape)
         return shapes
 
     def _angle_span(self, start, end):
@@ -2500,6 +3759,221 @@ class MainWindow(QMainWindow):
         self.status_widget.setStyleSheet(surface_css)
         self.status_label.setText(f"界面颜色: {theme_name}")
 
+    def _ensure_upcomer_pdf_data(self):
+        if self.upcomer_pdf_data is None:
+            self._load_upcomer_pdf_data()
+        return self.upcomer_pdf_data
+
+    def _notify_component_pending(self, name):
+        if self.output is not None:
+            self.output.append(f"{name}：绘制功能尚未实现。")
+        self.status_label.setText(f"{name}: 待实现")
+
+    def _draw_inner_cylinder_assembly(self):
+        canvas = self.current_canvas()
+        if canvas is None:
+            return
+
+        data = self._ensure_upcomer_pdf_data()
+        if data is None:
+            if self.output is not None:
+                self.output.append("未找到上升管1.7.pdf，无法提取尺寸并绘制内筒体组件。")
+            self.status_label.setText("未找到上升管1.7.pdf")
+            return
+
+        spec = resolve_inner_cylinder_spec(data)
+        canvas.clear()
+
+        margin = 60
+        available_w = max(200, canvas.width() - margin * 2)
+        available_h = max(200, canvas.height() - margin * 2)
+        total_h = spec["height"] + spec["flange_thickness"] * 2
+        total_w = max(spec["outer_diameter"], spec["flange_outer_diameter"])
+        scale = min(available_w / total_w, available_h / total_h) if total_w > 0 and total_h > 0 else 1.0
+        if scale <= 0:
+            scale = 1.0
+
+        cx = canvas.width() / 2.0
+        top = float(margin)
+        flange_thk = spec["flange_thickness"] * scale
+        body_height = spec["height"] * scale
+        body_top = top + flange_thk
+        body_bottom = body_top + body_height
+        flange_bottom = body_bottom + flange_thk
+        half_body = spec["outer_diameter"] * scale / 2.0
+        half_inner = spec["inner_diameter"] * scale / 2.0
+        half_flange = spec["flange_outer_diameter"] * scale / 2.0
+
+        canvas.add_rect(cx - half_flange, top, cx + half_flange, body_top)
+        canvas.add_rect(cx - half_body, body_top, cx + half_body, body_bottom)
+        canvas.add_rect(cx - half_flange, body_bottom, cx + half_flange, flange_bottom)
+
+        if 0 < spec["inner_diameter"] < spec["outer_diameter"]:
+            canvas.add_line(cx - half_inner, body_top, cx - half_inner, body_bottom)
+            canvas.add_line(cx + half_inner, body_top, cx + half_inner, body_bottom)
+
+        canvas.add_centerline(cx, top, cx, flange_bottom)
+
+        if self.output is not None:
+            summary = summarize_extraction(data)
+            self.output.append(
+                "已读取{pdf}，{summary}。绘制内筒体组件：外径∅{outer:.0f}、内径∅{inner:.0f}、高度{height:.0f}、"
+                "法兰外径∅{flange:.0f}。".format(
+                    pdf=os.path.basename(data.pdf_path),
+                    summary=summary,
+                    outer=spec["outer_diameter"],
+                    inner=spec["inner_diameter"],
+                    height=spec["height"],
+                    flange=spec["flange_outer_diameter"],
+                )
+            )
+        self.status_label.setText("已绘制: 内筒体组件")
+
+    def _open_inner_cylinder_params_dialog(self):
+        base_dir = os.path.dirname(__file__)
+        source_dir = os.path.join(base_dir, "project")
+        target_dir = os.path.join(base_dir, "project_new")
+        source_path = os.path.join(source_dir, "1内筒体组件.dxf")
+        target_path = os.path.join(target_dir, "1内筒体组件.dxf")
+        if not os.path.exists(source_path):
+            QMessageBox.critical(self, "未找到文件", "未找到 project/1内筒体组件.dxf，无法读取尺寸参数。")
+            if self.output is not None:
+                self.output.append("未找到 project/1内筒体组件.dxf，无法读取尺寸参数。")
+            self.status_label.setText("未找到 project/1内筒体组件.dxf")
+            return
+
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "复制失败", f"无法创建 project_new 文件夹：\n{exc}")
+            if self.output is not None:
+                self.output.append(f"创建 project_new 文件夹失败：{exc}")
+            self.status_label.setText("创建 project_new 失败")
+            return
+
+        try:
+            shutil.copy2(source_path, target_path)
+        except OSError as exc:
+            QMessageBox.critical(self, "复制失败", f"无法复制 1内筒体组件.dxf 到 project_new：\n{exc}")
+            if self.output is not None:
+                self.output.append(f"复制到 project_new 失败：{exc}")
+            self.status_label.setText("复制到 project_new 失败")
+            return
+
+        try:
+            raw_lines, entries = self._extract_dxf_dimension_params(target_path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "读取失败", f"无法读取 DXF 尺寸参数：\n{exc}")
+            if self.output is not None:
+                self.output.append(f"读取 DXF 尺寸参数失败：{exc}")
+            self.status_label.setText("读取尺寸参数失败")
+            return
+
+        if not entries:
+            QMessageBox.information(self, "未找到尺寸参数", "未在 project_new/1内筒体组件.dxf 中读取到尺寸参数。")
+            if self.output is not None:
+                self.output.append("未在 project_new/1内筒体组件.dxf 中读取到尺寸参数。")
+            self.status_label.setText("未读取到尺寸参数")
+            return
+
+        dialog = InnerCylinderParamsDialog(entries, self)
+        self._center_dialog(dialog)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        new_values = dialog.values()
+        try:
+            self._apply_dimension_updates(raw_lines, entries, new_values)
+        except ValueError as exc:
+            QMessageBox.warning(self, "参数错误", str(exc))
+            self.status_label.setText("参数校验失败")
+            return
+
+        try:
+            with open(target_path, "w", encoding="utf-8", newline="") as handle:
+                handle.writelines(raw_lines)
+        except OSError as exc:
+            QMessageBox.critical(self, "保存失败", f"无法保存 DXF：\n{exc}")
+            if self.output is not None:
+                self.output.append(f"保存 DXF 失败：{exc}")
+            self.status_label.setText("保存失败")
+            return
+
+        try:
+            payload = self._load_dxf_document(target_path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "打开失败", f"无法加载生成的 DXF：\n{exc}")
+            if self.output is not None:
+                self.output.append(f"打开生成的 DXF 失败：{exc}")
+            self.status_label.setText("打开失败")
+            return
+
+        name = payload.get("name") or "1内筒体组件"
+        template = payload.get("template", "二维草图")
+        shapes = payload.get("shapes", [])
+        document = self._add_document(name, template, path=target_path, shapes=shapes)
+        self._fit_canvas_on_shapes(document["canvas"])
+        if self.output is not None:
+            self.output.append(f"已生成并打开：{target_path}")
+        self.status_label.setText("已生成: project_new/1内筒体组件.dxf")
+
+    def _center_canvas_on_shapes(self, canvas):
+        if canvas is None:
+            return
+        bounds = None
+        for shape in canvas.shapes:
+            shape_bounds = canvas._shape_bounds(shape)
+            if shape_bounds is None:
+                continue
+            if bounds is None:
+                bounds = list(shape_bounds)
+            else:
+                bounds[0] = min(bounds[0], shape_bounds[0])
+                bounds[1] = min(bounds[1], shape_bounds[1])
+                bounds[2] = max(bounds[2], shape_bounds[2])
+                bounds[3] = max(bounds[3], shape_bounds[3])
+        if bounds is None:
+            return
+        x1, y1, x2, y2 = bounds
+        center_x = (x1 + x2) / 2.0
+        center_y = (y1 + y2) / 2.0
+        target_x = canvas.width() / 2.0
+        target_y = canvas.height() / 2.0
+        dx = target_x - center_x
+        dy = target_y - center_y
+        if abs(dx) > 0.01 or abs(dy) > 0.01:
+            canvas._apply_pan(dx, dy)
+            canvas.update()
+
+    def _fit_canvas_on_shapes(self, canvas, margin=40):
+        if canvas is None:
+            return
+        bounds = None
+        for shape in canvas.shapes:
+            shape_bounds = canvas._shape_bounds(shape)
+            if shape_bounds is None:
+                continue
+            if bounds is None:
+                bounds = list(shape_bounds)
+            else:
+                bounds[0] = min(bounds[0], shape_bounds[0])
+                bounds[1] = min(bounds[1], shape_bounds[1])
+                bounds[2] = max(bounds[2], shape_bounds[2])
+                bounds[3] = max(bounds[3], shape_bounds[3])
+        if bounds is None:
+            return
+        x1, y1, x2, y2 = bounds
+        width = max(1.0, x2 - x1)
+        height = max(1.0, y2 - y1)
+        avail_w = max(50.0, canvas.width() - margin * 2)
+        avail_h = max(50.0, canvas.height() - margin * 2)
+        factor = min(avail_w / width, avail_h / height)
+        factor = min(1.0, factor)
+        if factor < 0.99:
+            anchor = QPoint(int((x1 + x2) / 2.0), int((y1 + y2) / 2.0))
+            canvas._apply_zoom(factor, anchor)
+        self._center_canvas_on_shapes(canvas)
+
     def _tool_clicked(self, name, display_name=None):
         canvas = self.current_canvas()
         if canvas is None:
@@ -2508,6 +3982,12 @@ class MainWindow(QMainWindow):
         key = "".join(ch for ch in name.lower() if ch.isalnum() or ch == "_")
         label = display_name or TOOL_TIPS.get(name, name)
         self.current_tool_name = label
+        if name == "1内筒体组件":
+            self._open_inner_cylinder_params_dialog()
+            return
+        if name in ("2内筒体", "3 下接环组件", "3-1 下连接圈", "3-2下连接环"):
+            self._notify_component_pending(label)
+            return
         if name == "Layer Props":
             self._toggle_layer_manager(True)
             self.status_label.setText("图层特性管理器已打开")
