@@ -2528,16 +2528,14 @@ class MainWindow(QMainWindow):
             PolylinePath = None
             EdgePath = None
 
-        def _extend_path(path_points, edge_points):
-            if not edge_points:
-                return path_points
-            if not path_points:
-                path_points.extend(edge_points)
-                return path_points
-            if path_points[-1] != edge_points[0]:
-                path_points.append(edge_points[0])
-            path_points.extend(edge_points[1:])
-            return path_points
+        def _append_loop(points):
+            if not points or len(points) < 3:
+                return
+            loop = list(points)
+            if loop[0] != loop[-1]:
+                loop.append(loop[0])
+            if len(loop) >= 4:
+                loops.append(tuple(loop))
 
         def _arc_edge_points(cx, cy, radius, start, end, ccw_flag):
             if radius <= 0:
@@ -2587,8 +2585,7 @@ class MainWindow(QMainWindow):
                 for x, y, bulge in path.vertices:
                     vertices.append({"x": x, "y": -y, "bulge": -(bulge or 0.0)})
                 points = self._bulge_vertices_to_points(vertices, bool(path.is_closed))
-                if points:
-                    loops.append(tuple(points))
+                _append_loop(points)
                 continue
 
             if EdgePath and isinstance(path, EdgePath):
@@ -2618,11 +2615,20 @@ class MainWindow(QMainWindow):
                         edge_pts = [(pt.x, -pt.y) for pt in points]
                     else:
                         edge_pts = []
-                    _extend_path(path_points, edge_pts)
-                if path_points:
-                    if path_points[0] != path_points[-1]:
-                        path_points.append(path_points[0])
-                    loops.append(tuple(path_points))
+                    if not edge_pts:
+                        continue
+                    if not path_points:
+                        path_points.extend(edge_pts)
+                        continue
+                    last = path_points[-1]
+                    if last == edge_pts[0]:
+                        path_points.extend(edge_pts[1:])
+                    elif last == edge_pts[-1]:
+                        path_points.extend(list(reversed(edge_pts[:-1])))
+                    else:
+                        _append_loop(path_points)
+                        path_points = list(edge_pts)
+                _append_loop(path_points)
                 continue
 
         return loops
@@ -3351,8 +3357,13 @@ class MainWindow(QMainWindow):
         loops = []
 
         def _append_loop(points):
-            if points and len(points) >= 3:
-                loops.append(tuple(points))
+            if not points or len(points) < 3:
+                return
+            loop = list(points)
+            if loop[0] != loop[-1]:
+                loop.append(loop[0])
+            if len(loop) >= 4:
+                loops.append(tuple(loop))
 
         def _extend_path(path_points, edge_points):
             if not edge_points:
@@ -3360,9 +3371,15 @@ class MainWindow(QMainWindow):
             if not path_points:
                 path_points.extend(edge_points)
                 return path_points
-            if path_points[-1] != edge_points[0]:
-                path_points.append(edge_points[0])
-            path_points.extend(edge_points[1:])
+            if path_points[-1] == edge_points[0]:
+                path_points.extend(edge_points[1:])
+                return path_points
+            if path_points[-1] == edge_points[-1]:
+                path_points.extend(list(reversed(edge_points[:-1])))
+                return path_points
+            _append_loop(path_points)
+            path_points.clear()
+            path_points.extend(edge_points)
             return path_points
 
         def _arc_edge_points(cx, cy, radius, start, end, ccw_flag):

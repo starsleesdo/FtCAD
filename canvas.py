@@ -102,39 +102,7 @@ class Canvas(QWidget):
                 x2, y2 = points[0]
                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
         elif shape_type == 'hatch':
-            loops = shape['params']
-            for loop in loops or []:
-                if not loop or len(loop) < 2:
-                    continue
-                for index in range(len(loop) - 1):
-                    x1, y1 = loop[index]
-                    x2, y2 = loop[index + 1]
-                    painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-        elif shape_type == 'hatch':
-            loops = shape['params']
-            if not loops:
-                return
-            painter.save()
-            color = None
-            style = shape.get('style') or {}
-            color = self._color_from_name(style.get("color"))
-            fill = QColor(color or self.drawing_color)
-            fill.setAlpha(80)
-            painter.setBrush(fill)
-            pen = QPen(color or self.drawing_color)
-            pen.setWidth(1)
-            pen.setStyle(Qt.SolidLine)
-            painter.setPen(pen)
-            path = QPainterPath()
-            path.setFillRule(Qt.OddEvenFill)
-            for loop in loops:
-                if not loop or len(loop) < 3:
-                    continue
-                polygon = QPolygonF([QPointF(x, y) for x, y in loop])
-                path.addPolygon(polygon)
-                path.closeSubpath()
-            painter.drawPath(path)
-            painter.restore()
+            self._draw_hatch(painter, shape)
         elif shape_type == 'ellipse':
             x1, y1, x2, y2 = shape['params']
             painter.drawEllipse(int(min(x1, x2)), int(min(y1, y2)), abs(int(x2 - x1)), abs(int(y2 - y1)))
@@ -204,6 +172,68 @@ class Canvas(QWidget):
                 for idx, line in enumerate(lines):
                     painter.drawText(int(x), int(y + idx * line_height), line)
             painter.restore()
+
+    def _draw_hatch(self, painter, shape):
+        loops = shape.get('params') or []
+        if not loops:
+            return
+        valid_loops = []
+        min_x = min_y = max_x = max_y = None
+        for loop in loops:
+            if not loop or len(loop) < 3:
+                continue
+            points = list(loop)
+            if points[0] != points[-1]:
+                points.append(points[0])
+            valid_loops.append(points)
+            for x, y in points:
+                if min_x is None:
+                    min_x = max_x = x
+                    min_y = max_y = y
+                else:
+                    min_x = min(min_x, x)
+                    min_y = min(min_y, y)
+                    max_x = max(max_x, x)
+                    max_y = max(max_y, y)
+        if not valid_loops or min_x is None:
+            return
+
+        style = shape.get('style') or {}
+        color = self._color_from_name(style.get("color")) or self.drawing_color
+        width = self._lineweight_to_width(style.get("lineweight"))
+        pen = QPen(color)
+        pen.setWidth(width)
+        pen.setStyle(Qt.SolidLine)
+
+        path = QPainterPath()
+        path.setFillRule(Qt.OddEvenFill)
+        for loop in valid_loops:
+            polygon = QPolygonF([QPointF(x, y) for x, y in loop])
+            path.addPolygon(polygon)
+            path.closeSubpath()
+
+        height = max(1.0, max_y - min_y)
+        spacing = max(6.0, float(self.grid_step) * 0.5)
+        start = min_x - height
+        end = max_x + height
+
+        painter.save()
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.setClipPath(path)
+        x = start
+        while x <= end:
+            painter.drawLine(QPointF(x, max_y), QPointF(x + height, min_y))
+            x += spacing
+        painter.restore()
+
+        painter.save()
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        for loop in valid_loops:
+            polygon = QPolygonF([QPointF(x, y) for x, y in loop])
+            painter.drawPolyline(polygon)
+        painter.restore()
 
     def _draw_shape_geometry(self, painter, shape):
         shape_type = shape['type']
