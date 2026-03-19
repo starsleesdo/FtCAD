@@ -2315,6 +2315,10 @@ class Canvas(QWidget):
             super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event):
+        if event.modifiers() & Qt.ControlModifier and event.key() == Qt.Key_Z:
+            self.undo()
+            event.accept()
+            return
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             if self.selected_indices:
                 self._push_undo()

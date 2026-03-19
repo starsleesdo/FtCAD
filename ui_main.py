@@ -972,6 +972,15 @@ class MainWindow(QMainWindow):
             self.undo_btn,
             self.redo_btn,
         ) = buttons
+        base_dir = os.path.dirname(__file__)
+        undo_icon = os.path.join(base_dir, "icons", "上一步.svg")
+        redo_icon = os.path.join(base_dir, "icons", "下一步.svg")
+        if os.path.exists(undo_icon):
+            self.undo_btn.setIcon(QIcon(undo_icon))
+            self.undo_btn.setIconSize(self.toolbar_icon_size)
+        if os.path.exists(redo_icon):
+            self.redo_btn.setIcon(QIcon(redo_icon))
+            self.redo_btn.setIconSize(self.toolbar_icon_size)
         for button in buttons:
             layout.addWidget(button)
 
