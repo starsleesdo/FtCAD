@@ -1,7 +1,7 @@
 ﻿import math
 
 from PySide6.QtWidgets import QWidget, QInputDialog
-from PySide6.QtGui import QPainter, QColor, QPen, QFont
+from PySide6.QtGui import QPainter, QColor, QPen, QFont, QPainterPath, QPolygonF
 from PySide6.QtCore import Qt, QPoint, QPointF, QRectF, Signal
 
 
@@ -101,6 +101,40 @@ class Canvas(QWidget):
                 x1, y1 = points[-1]
                 x2, y2 = points[0]
                 painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        elif shape_type == 'hatch':
+            loops = shape['params']
+            for loop in loops or []:
+                if not loop or len(loop) < 2:
+                    continue
+                for index in range(len(loop) - 1):
+                    x1, y1 = loop[index]
+                    x2, y2 = loop[index + 1]
+                    painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        elif shape_type == 'hatch':
+            loops = shape['params']
+            if not loops:
+                return
+            painter.save()
+            color = None
+            style = shape.get('style') or {}
+            color = self._color_from_name(style.get("color"))
+            fill = QColor(color or self.drawing_color)
+            fill.setAlpha(80)
+            painter.setBrush(fill)
+            pen = QPen(color or self.drawing_color)
+            pen.setWidth(1)
+            pen.setStyle(Qt.SolidLine)
+            painter.setPen(pen)
+            path = QPainterPath()
+            path.setFillRule(Qt.OddEvenFill)
+            for loop in loops:
+                if not loop or len(loop) < 3:
+                    continue
+                polygon = QPolygonF([QPointF(x, y) for x, y in loop])
+                path.addPolygon(polygon)
+                path.closeSubpath()
+            painter.drawPath(path)
+            painter.restore()
         elif shape_type == 'ellipse':
             x1, y1, x2, y2 = shape['params']
             painter.drawEllipse(int(min(x1, x2)), int(min(y1, y2)), abs(int(x2 - x1)), abs(int(y2 - y1)))
@@ -861,6 +895,18 @@ class Canvas(QWidget):
                 for x, y in points
             )
             shape['params'] = (scaled, closed)
+        elif shape_type == 'hatch':
+            loops = []
+            for loop in params or []:
+                scaled_loop = tuple(
+                    (
+                        self._scale_value(x, anchor_x, factor),
+                        self._scale_value(y, anchor_y, factor),
+                    )
+                    for x, y in loop
+                )
+                loops.append(scaled_loop)
+            shape['params'] = tuple(loops)
         elif shape_type == 'arc_angle':
             cx, cy, radius, start_angle, span_angle = params
             shape['params'] = (
@@ -1607,6 +1653,9 @@ class Canvas(QWidget):
         if shape['type'] == 'polyline':
             points, closed = shape['params']
             base = {'type': 'polyline', 'params': (tuple(points), closed)}
+        elif shape['type'] == 'hatch':
+            loops = shape['params']
+            base = {'type': 'hatch', 'params': tuple(tuple(loop) for loop in loops or [])}
         else:
             base = {'type': shape['type'], 'params': shape['params']}
         if 'layer' in shape:
@@ -1634,6 +1683,12 @@ class Canvas(QWidget):
             points, closed = params
             moved = tuple((x + dx, y + dy) for x, y in points)
             shape['params'] = (moved, closed)
+        elif shape_type == 'hatch':
+            loops = []
+            for loop in params or []:
+                moved = tuple((x + dx, y + dy) for x, y in loop)
+                loops.append(moved)
+            shape['params'] = tuple(loops)
         elif shape_type == 'center_mark':
             cx, cy, size = params
             shape['params'] = (cx + dx, cy + dy, size)
@@ -1675,6 +1730,12 @@ class Canvas(QWidget):
             points, closed = params
             rotated = tuple(self._rotate_point(x, y, cx, cy, angle_deg) for x, y in points)
             shape['params'] = (rotated, closed)
+        elif shape_type == 'hatch':
+            loops = []
+            for loop in params or []:
+                rotated = tuple(self._rotate_point(x, y, cx, cy, angle_deg) for x, y in loop)
+                loops.append(rotated)
+            shape['params'] = tuple(loops)
         elif shape_type == 'center_mark':
             ox, oy, size = params
             new_center = self._rotate_point(ox, oy, cx, cy, angle_deg)
@@ -1703,6 +1764,14 @@ class Canvas(QWidget):
             return QPointF(cx, cy)
         if shape_type == 'polyline':
             points, _ = params
+            if not points:
+                return None
+            sx = sum(x for x, _ in points)
+            sy = sum(y for _, y in points)
+            return QPointF(sx / len(points), sy / len(points))
+        if shape_type == 'hatch':
+            loops = params or []
+            points = [pt for loop in loops for pt in loop]
             if not points:
                 return None
             sx = sum(x for x, _ in points)
@@ -2147,19 +2216,20 @@ class Canvas(QWidget):
         drag_distance = abs(x2 - x1) + abs(y2 - y1)
         modifiers = event.modifiers()
         additive = bool(modifiers & (Qt.ControlModifier | Qt.ShiftModifier))
+        clicked_index = None
         if drag_distance <= 4:
-            index = self._hit_test(pos)
-            if index is None:
+            clicked_index = self._hit_test(pos)
+            if clicked_index is None:
                 if not additive:
                     self.selected_indices.clear()
             else:
                 if additive:
-                    if index in self.selected_indices:
-                        self.selected_indices.remove(index)
+                    if clicked_index in self.selected_indices:
+                        self.selected_indices.remove(clicked_index)
                     else:
-                        self.selected_indices.add(index)
+                        self.selected_indices.add(clicked_index)
                 else:
-                    self.selected_indices = {index}
+                    self.selected_indices = {clicked_index}
         else:
             window_select = False
             if self._selection_start is not None and self._selection_end is not None:
@@ -2172,6 +2242,10 @@ class Canvas(QWidget):
         self._selection_start = None
         self._selection_end = None
         self.update()
+        if drag_distance <= 4 and clicked_index is not None and not additive:
+            if self._edit_text_shape(clicked_index):
+                self.selected_indices = {clicked_index}
+                self.update()
 
     def mouseDoubleClickEvent(self, event):
         if self.current_tool == 'polyline' and len(self._poly_points) >= 2:
@@ -2348,6 +2422,16 @@ class Canvas(QWidget):
             xs = [pt[0] for pt in points]
             ys = [pt[1] for pt in points]
             return min(xs), min(ys), max(xs), max(ys)
+        if shape_type == 'hatch':
+            loops = shape['params']
+            all_points = []
+            for loop in loops or []:
+                all_points.extend(loop)
+            if not all_points:
+                return None
+            xs = [pt[0] for pt in all_points]
+            ys = [pt[1] for pt in all_points]
+            return min(xs), min(ys), max(xs), max(ys)
         if shape_type == 'center_mark':
             cx, cy, size = shape['params']
             half = size / 2.0
@@ -2439,6 +2523,13 @@ class Canvas(QWidget):
                     distance = self._distance_point_to_segment(pos.x(), pos.y(), x1, y1, x2, y2)
                     if distance <= tol:
                         return index
+            elif shape['type'] == 'hatch':
+                bounds = self._shape_bounds(shape)
+                if bounds is None:
+                    continue
+                x1, y1, x2, y2 = bounds
+                if x1 - tol <= pos.x() <= x2 + tol and y1 - tol <= pos.y() <= y2 + tol:
+                    return index
                 if closed and len(points) > 2:
                     x1, y1 = points[-1]
                     x2, y2 = points[0]
@@ -2477,6 +2568,23 @@ class Canvas(QWidget):
                     if self._angle_in_span(start_angle, span_angle, angle):
                         return index
         return None
+
+    def _edit_text_shape(self, index):
+        if not (0 <= index < len(self.shapes)):
+            return False
+        shape = self.shapes[index]
+        if shape.get("type") != "text":
+            return False
+        x, y, text, height, rotation = shape["params"]
+        current = "" if text is None else str(text)
+        new_text, ok = QInputDialog.getMultiLineText(self, "编辑文字", "文字内容:", current)
+        if not ok:
+            return False
+        if new_text == current:
+            return True
+        self._push_undo()
+        shape["params"] = (x, y, new_text, height, rotation)
+        return True
 
     def set_symmetry_mode(self, enabled):
         self.symmetry_mode = bool(enabled)

@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 
@@ -1940,7 +1941,10 @@ class MainWindow(QMainWindow):
         return data
 
     def _load_dxf_document(self, path):
-        cleaned_lines, _ = self._read_dxf_lines(path)
+        payload = self._load_dxf_document_ezdxf(path)
+        if payload:
+            return payload
+        cleaned_lines, _, _ = self._read_dxf_lines(path)
         if len(cleaned_lines) < 2:
             raise ValueError("DXF 内容为空")
 
@@ -2053,11 +2057,161 @@ class MainWindow(QMainWindow):
             "shapes": shapes,
         }
 
+    def _try_oda_convert(self, path):
+        cmd_template = os.environ.get("ODA_CONVERTER_CMD")
+        if not cmd_template:
+            return None
+        try:
+            import tempfile
+            import subprocess
+        except Exception:
+            return None
+
+        source_dir = os.path.dirname(path)
+        file_name = os.path.basename(path)
+        out_dir = tempfile.mkdtemp(prefix="oda_")
+        out_path = os.path.join(out_dir, f"{os.path.splitext(file_name)[0]}.dxf")
+
+        cmd = cmd_template.format(
+            input=path,
+            input_dir=source_dir,
+            input_filter=file_name,
+            output_dir=out_dir,
+            output=out_path,
+        )
+        try:
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return None
+
+        if os.path.exists(out_path):
+            return out_path
+        try:
+            for entry in os.listdir(out_dir):
+                if entry.lower().endswith(".dxf"):
+                    return os.path.join(out_dir, entry)
+        except OSError:
+            return None
+        return None
+
+    def _load_dxf_document_ezdxf(self, path):
+        try:
+            import ezdxf
+        except Exception:
+            return None
+
+        force_oda = str(os.environ.get("ODA_CONVERTER_ALWAYS", "")).strip().lower() in ("1", "true", "yes")
+        if force_oda:
+            converted = self._try_oda_convert(path)
+            if converted:
+                path = converted
+
+        doc = None
+        try:
+            doc = ezdxf.readfile(path)
+        except Exception:
+            converted = self._try_oda_convert(path)
+            if converted:
+                try:
+                    doc = ezdxf.readfile(converted)
+                except Exception:
+                    doc = None
+            if doc is None:
+                try:
+                    from ezdxf import recover
+                    doc, _auditor = recover.readfile(path)
+                except Exception:
+                    return None
+
+        if doc is None:
+            return None
+
+        layer_styles = self._ezdxf_layer_styles(doc)
+        shapes = []
+        try:
+            modelspace = doc.modelspace()
+            for entity in modelspace:
+                self._collect_ezdxf_entity_shapes(entity, shapes, layer_styles)
+        except Exception:
+            return None
+
+        if not shapes:
+            return None
+
+        return {
+            "name": os.path.splitext(os.path.basename(path))[0],
+            "template": "二维草图",
+            "shapes": shapes,
+        }
+
+    def _detect_dxf_encoding(self, path):
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            return "utf-8"
+
+        if data.startswith(b"\xef\xbb\xbf"):
+            return "utf-8-sig"
+        if data.startswith(b"\xff\xfe"):
+            return "utf-16-le"
+        if data.startswith(b"\xfe\xff"):
+            return "utf-16-be"
+
+        try:
+            data.decode("utf-8")
+            return "utf-8"
+        except UnicodeDecodeError:
+            pass
+
+        sample = data[:65536]
+        text = sample.decode("latin-1", errors="ignore")
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        codepage = None
+        for idx, line in enumerate(lines):
+            if line.strip().upper() == "$DWGCODEPAGE":
+                if idx + 2 < len(lines):
+                    codepage = lines[idx + 2].strip()
+                elif idx + 1 < len(lines):
+                    codepage = lines[idx + 1].strip()
+                break
+        return self._map_dxf_codepage(codepage)
+
+    def _map_dxf_codepage(self, codepage):
+        if not codepage:
+            return "utf-8"
+        normalized = codepage.strip().upper()
+        mapping = {
+            "ANSI_932": "shift_jis",
+            "ANSI_936": "gbk",
+            "ANSI_949": "cp949",
+            "ANSI_950": "cp950",
+            "ANSI_1250": "cp1250",
+            "ANSI_1251": "cp1251",
+            "ANSI_1252": "cp1252",
+            "ANSI_1253": "cp1253",
+            "ANSI_1254": "cp1254",
+            "ANSI_1255": "cp1255",
+            "ANSI_1256": "cp1256",
+            "ANSI_1257": "cp1257",
+            "ANSI_1258": "cp1258",
+            "UTF-8": "utf-8",
+            "UTF8": "utf-8",
+        }
+        if normalized in mapping:
+            return mapping[normalized]
+        if normalized.startswith("ANSI_"):
+            suffix = normalized.split("_", 1)[1]
+            if suffix.isdigit():
+                return f"cp{suffix}"
+        return "utf-8"
+
     def _read_dxf_lines(self, path):
-        with open(path, "r", encoding="utf-8", errors="ignore", newline="") as handle:
+        encoding = self._detect_dxf_encoding(path)
+        with open(path, "r", encoding=encoding, errors="replace", newline="") as handle:
             raw_lines = handle.readlines()
         cleaned = [line.rstrip("\r\n") for line in raw_lines]
-        return cleaned, raw_lines
+        return cleaned, raw_lines, encoding
 
     def _safe_int(self, value):
         try:
@@ -2111,6 +2265,367 @@ class MainWindow(QMainWindow):
             if lw is not None and lw > 0:
                 style["lineweight"] = f"{lw / 100.0:.2f}"
         return style or None
+
+    def _ezdxf_layer_styles(self, doc):
+        styles = {}
+        try:
+            layers = doc.layers
+        except Exception:
+            return styles
+        for layer in layers:
+            entry = {}
+            try:
+                entry["name"] = layer.dxf.name
+                entry["color_index"] = layer.dxf.color
+                entry["true_color"] = getattr(layer.dxf, "true_color", None)
+                entry["linetype"] = layer.dxf.linetype
+                entry["lineweight"] = layer.dxf.lineweight
+            except Exception:
+                continue
+            style = self._layer_style_from_entry(entry)
+            if style:
+                styles[entry["name"]] = style
+        return styles
+
+    def _ezdxf_entity_style(self, entity, layer_styles):
+        layer_name = None
+        style = {}
+        try:
+            layer_name = entity.dxf.layer
+        except Exception:
+            layer_name = None
+        base = layer_styles.get(layer_name)
+        if base:
+            style.update(base)
+
+        try:
+            true_color = getattr(entity.dxf, "true_color", None)
+        except Exception:
+            true_color = None
+        if true_color is not None:
+            color = self._truecolor_to_hex(true_color)
+            if color:
+                style["color"] = color
+        else:
+            try:
+                color_index = entity.dxf.color
+            except Exception:
+                color_index = None
+            if color_index is not None and color_index not in (0, 256):
+                color = self._aci_color_to_hex(abs(color_index))
+                if color:
+                    style["color"] = color
+
+        try:
+            linetype = entity.dxf.linetype
+        except Exception:
+            linetype = None
+        if linetype and str(linetype).upper() not in ("BYLAYER", "BYBLOCK"):
+            style["linetype"] = linetype
+
+        try:
+            lineweight = entity.dxf.lineweight
+        except Exception:
+            lineweight = None
+        if lineweight is not None and lineweight > 0:
+            style["lineweight"] = f"{lineweight / 100.0:.2f}"
+
+        return layer_name, style or None
+
+    def _collect_ezdxf_entity_shapes(self, entity, shapes, layer_styles):
+        def _vec_xy(vec):
+            try:
+                return vec.x, vec.y
+            except AttributeError:
+                return vec[0], vec[1]
+
+        try:
+            dxftype = entity.dxftype()
+        except Exception:
+            return
+
+        if dxftype in ("INSERT", "DIMENSION"):
+            try:
+                for sub in entity.virtual_entities():
+                    self._collect_ezdxf_entity_shapes(sub, shapes, layer_styles)
+            except Exception:
+                pass
+            if dxftype == "INSERT":
+                try:
+                    for attrib in entity.attribs:
+                        self._collect_ezdxf_entity_shapes(attrib, shapes, layer_styles)
+                except Exception:
+                    pass
+            return
+
+        layer_name, style = self._ezdxf_entity_style(entity, layer_styles)
+
+        def _append(shape):
+            if layer_name:
+                shape["layer"] = layer_name
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
+
+        if dxftype == "LINE":
+            start = entity.dxf.start
+            end = entity.dxf.end
+            x1, y1 = _vec_xy(start)
+            x2, y2 = _vec_xy(end)
+            _append({"type": "line", "params": (x1, -y1, x2, -y2)})
+            return
+
+        if dxftype == "CIRCLE":
+            center = entity.dxf.center
+            cx, cy = _vec_xy(center)
+            radius = abs(entity.dxf.radius)
+            _append({"type": "circle", "params": (cx, -cy, radius)})
+            return
+
+        if dxftype == "ARC":
+            center = entity.dxf.center
+            cx, cy = _vec_xy(center)
+            radius = abs(entity.dxf.radius)
+            start = entity.dxf.start_angle
+            end = entity.dxf.end_angle
+            span = -self._angle_span(start, end)
+            start_angle = -start
+            _append({"type": "arc_angle", "params": (cx, -cy, radius, start_angle, span)})
+            return
+
+        if dxftype == "ELLIPSE":
+            center = entity.dxf.center
+            major = entity.dxf.major_axis
+            ratio = entity.dxf.ratio
+            start_param = entity.dxf.start_param
+            end_param = entity.dxf.end_param
+            cx, cy = _vec_xy(center)
+            major_dx, major_dy = _vec_xy(major)
+            major_vec = (major_dx, -major_dy)
+            minor_vec = (-major_vec[1] * ratio, major_vec[0] * ratio)
+            span = end_param - start_param
+            if span <= 0:
+                span += math.tau
+            steps = max(12, int(abs(span) / (math.tau / 48)))
+            points = []
+            cy_screen = -cy
+            for i in range(steps + 1):
+                t = start_param + span * (i / steps)
+                x = cx + major_vec[0] * math.cos(t) + minor_vec[0] * math.sin(t)
+                y = cy_screen + major_vec[1] * math.cos(t) + minor_vec[1] * math.sin(t)
+                points.append((x, y))
+            if len(points) >= 2:
+                _append({"type": "polyline", "params": (tuple(points), False)})
+            return
+
+        if dxftype == "LWPOLYLINE":
+            try:
+                closed = bool(entity.closed)
+            except Exception:
+                closed = False
+            vertices = []
+            for x, y, bulge in entity.get_points("xyb"):
+                vertices.append({"x": x, "y": -y, "bulge": -(bulge or 0.0)})
+            points = self._bulge_vertices_to_points(vertices, closed)
+            if len(points) >= 2:
+                _append({"type": "polyline", "params": (tuple(points), False)})
+            return
+
+        if dxftype == "POLYLINE":
+            try:
+                closed = bool(entity.is_closed)
+            except Exception:
+                closed = False
+            vertices = []
+            try:
+                iterator = entity.vertices
+            except Exception:
+                iterator = []
+            for vtx in iterator:
+                try:
+                    x, y = _vec_xy(vtx.dxf.location)
+                except Exception:
+                    continue
+                bulge = getattr(vtx.dxf, "bulge", 0.0) or 0.0
+                vertices.append({"x": x, "y": -y, "bulge": -bulge})
+            points = self._bulge_vertices_to_points(vertices, closed)
+            if len(points) >= 2:
+                _append({"type": "polyline", "params": (tuple(points), False)})
+            return
+
+        if dxftype == "SPLINE":
+            points = []
+            try:
+                for pt in entity.flattening(0.5):
+                    x, y = _vec_xy(pt)
+                    points.append((x, -y))
+            except Exception:
+                try:
+                    pts = entity.fit_points
+                except Exception:
+                    pts = []
+                if len(pts) < 2:
+                    try:
+                        pts = entity.control_points
+                    except Exception:
+                        pts = []
+                for pt in pts:
+                    x, y = _vec_xy(pt)
+                    points.append((x, -y))
+            if len(points) >= 2:
+                _append({"type": "polyline", "params": (tuple(points), False)})
+            return
+
+        if dxftype in ("TEXT", "ATTRIB", "ATTDEF"):
+            insert = entity.dxf.insert
+            x, y = _vec_xy(insert)
+            height = getattr(entity.dxf, "height", None)
+            rotation = getattr(entity.dxf, "rotation", 0.0) or 0.0
+            text_value = getattr(entity.dxf, "text", "")
+            text_value = self._decode_dxf_text(text_value)
+            _append({"type": "text", "params": (x, -y, text_value, height, -rotation)})
+            return
+
+        if dxftype == "MTEXT":
+            insert = entity.dxf.insert
+            x, y = _vec_xy(insert)
+            height = getattr(entity.dxf, "char_height", None)
+            rotation = getattr(entity.dxf, "rotation", 0.0) or 0.0
+            try:
+                text_value = entity.plain_text()
+            except Exception:
+                text_value = getattr(entity.dxf, "text", "")
+            text_value = self._decode_dxf_text(text_value)
+            _append({"type": "text", "params": (x, -y, text_value, height, -rotation)})
+            return
+
+        if dxftype == "SOLID":
+            points = []
+            for key in ("vtx0", "vtx1", "vtx2", "vtx3"):
+                try:
+                    v = getattr(entity.dxf, key)
+                except Exception:
+                    v = None
+                if v is None:
+                    continue
+                x, y = _vec_xy(v)
+                points.append((x, -y))
+            if len(points) >= 3:
+                _append({"type": "polyline", "params": (tuple(points), True)})
+            return
+
+        if dxftype == "HATCH":
+            loops = self._ezdxf_hatch_loops(entity)
+            if loops:
+                _append({"type": "hatch", "params": tuple(loops)})
+            return
+
+    def _ezdxf_hatch_loops(self, hatch):
+        loops = []
+        try:
+            from ezdxf.entities.boundary_paths import PolylinePath, EdgePath
+        except Exception:
+            PolylinePath = None
+            EdgePath = None
+
+        def _extend_path(path_points, edge_points):
+            if not edge_points:
+                return path_points
+            if not path_points:
+                path_points.extend(edge_points)
+                return path_points
+            if path_points[-1] != edge_points[0]:
+                path_points.append(edge_points[0])
+            path_points.extend(edge_points[1:])
+            return path_points
+
+        def _arc_edge_points(cx, cy, radius, start, end, ccw_flag):
+            if radius <= 0:
+                return []
+            start_angle = -start
+            end_angle = -end
+            ccw_screen = not bool(ccw_flag)
+            if ccw_screen:
+                span = self._angle_span(start_angle, end_angle)
+            else:
+                span = -self._angle_span(end_angle, start_angle)
+            steps = max(8, int(abs(span) / 10.0))
+            pts = []
+            cy_screen = -cy
+            for i in range(steps + 1):
+                angle = start_angle + span * (i / steps)
+                radians = math.radians(angle)
+                pts.append((cx + math.cos(radians) * radius, cy_screen + math.sin(radians) * radius))
+            return pts
+
+        def _ellipse_edge_points(center, major_axis, ratio, start_angle, end_angle, ccw_flag):
+            cx, cy = center
+            major_dx, major_dy = major_axis
+            major_vec = (major_dx, -major_dy)
+            minor_vec = (-major_vec[1] * ratio, major_vec[0] * ratio)
+            start = -start_angle
+            end = -end_angle
+            ccw_screen = not bool(ccw_flag)
+            if ccw_screen:
+                span = self._angle_span(start, end)
+            else:
+                span = -self._angle_span(end, start)
+            steps = max(12, int(abs(span) / 10.0))
+            pts = []
+            cy_screen = -cy
+            for i in range(steps + 1):
+                angle = start + span * (i / steps)
+                radians = math.radians(angle)
+                x = cx + major_vec[0] * math.cos(radians) + minor_vec[0] * math.sin(radians)
+                y = cy_screen + major_vec[1] * math.cos(radians) + minor_vec[1] * math.sin(radians)
+                pts.append((x, y))
+            return pts
+
+        for path in hatch.paths:
+            if PolylinePath and isinstance(path, PolylinePath):
+                vertices = []
+                for x, y, bulge in path.vertices:
+                    vertices.append({"x": x, "y": -y, "bulge": -(bulge or 0.0)})
+                points = self._bulge_vertices_to_points(vertices, bool(path.is_closed))
+                if points:
+                    loops.append(tuple(points))
+                continue
+
+            if EdgePath and isinstance(path, EdgePath):
+                path_points = []
+                for edge in path.edges:
+                    edge_type = type(edge).__name__
+                    if edge_type == "LineEdge":
+                        start = edge.start
+                        end = edge.end
+                        edge_pts = [(start.x, -start.y), (end.x, -end.y)]
+                    elif edge_type == "ArcEdge":
+                        center = edge.center
+                        edge_pts = _arc_edge_points(center.x, center.y, edge.radius, edge.start_angle, edge.end_angle, edge.ccw)
+                    elif edge_type == "EllipseEdge":
+                        center = edge.center
+                        major = edge.major_axis
+                        edge_pts = _ellipse_edge_points(
+                            (center.x, center.y),
+                            (major.x, major.y),
+                            edge.ratio,
+                            edge.start_angle,
+                            edge.end_angle,
+                            edge.ccw,
+                        )
+                    elif edge_type == "SplineEdge":
+                        points = edge.fit_points if edge.fit_points else edge.control_points
+                        edge_pts = [(pt.x, -pt.y) for pt in points]
+                    else:
+                        edge_pts = []
+                    _extend_path(path_points, edge_pts)
+                if path_points:
+                    if path_points[0] != path_points[-1]:
+                        path_points.append(path_points[0])
+                    loops.append(tuple(path_points))
+                continue
+
+        return loops
 
     def _parse_dxf_layer_table(self, pairs, start_index, layer_styles):
         idx = start_index + 1
@@ -2225,7 +2740,7 @@ class MainWindow(QMainWindow):
         return merged or None
 
     def _extract_dxf_dimension_params(self, path):
-        cleaned, raw_lines = self._read_dxf_lines(path)
+        cleaned, raw_lines, encoding = self._read_dxf_lines(path)
         if len(cleaned) < 2:
             raise ValueError("DXF 内容为空")
 
@@ -2281,7 +2796,7 @@ class MainWindow(QMainWindow):
                 idx = j
                 continue
             idx += 2
-        return raw_lines, entries
+        return raw_lines, entries, encoding
 
     def _replace_dxf_value_line(self, raw_lines, index, value):
         if index is None or index < 0 or index >= len(raw_lines):
@@ -2495,7 +3010,7 @@ class MainWindow(QMainWindow):
                 pending_x = None
                 pending_bulge = 0.0
             elif code == "42":
-                bulge_val = self._parse_float(value) or 0.0
+                bulge_val = -(self._parse_float(value) or 0.0)
                 if last_index is not None and pending_x is None:
                     vertices[last_index]["bulge"] = bulge_val
                 else:
@@ -2547,7 +3062,7 @@ class MainWindow(QMainWindow):
                     elif c == "20":
                         vy = self._parse_float(v)
                     elif c == "42":
-                        bulge = self._parse_float(v) or 0.0
+                        bulge = -(self._parse_float(v) or 0.0)
                     idx += 1
                 if vx is not None and vy is not None:
                     vertices.append({"x": vx, "y": -vy, "bulge": bulge})
@@ -2689,6 +3204,7 @@ class MainWindow(QMainWindow):
 
         if x is None or y is None or text_value is None:
             return idx
+        text_value = self._decode_dxf_text(text_value)
         if (height is None or height <= 0) and text_styles and style_name:
             height = text_styles.get(style_name, height)
         shape = {
@@ -2702,13 +3218,37 @@ class MainWindow(QMainWindow):
         shapes.append(shape)
         return idx
 
+    def _decode_dxf_text(self, text):
+        if text is None:
+            return ""
+        value = str(text)
+
+        def _pct_repl(match):
+            mapping = {"c": "Ø", "d": "°", "p": "±"}
+            return mapping.get(match.group(1).lower(), match.group(0))
+
+        value = re.sub(r"%%([cCdDpP])", _pct_repl, value)
+
+        def _uni_repl(match):
+            try:
+                return chr(int(match.group(1), 16))
+            except ValueError:
+                return match.group(0)
+
+        value = re.sub(r"\\U\+([0-9A-Fa-f]{4,8})", _uni_repl, value)
+        return value
+
     def _clean_mtext(self, text):
         if not text:
             return ""
         cleaned = text.replace("\\P", "\n").replace("\\~", " ")
+        cleaned = re.sub(r"\\S([^;]+);", lambda m: m.group(1).replace("#", "/"), cleaned)
+        cleaned = re.sub(r"\\[ACQFLHWT][^;]*;", "", cleaned)
+        cleaned = re.sub(r"\\A\d+", "", cleaned)
+        cleaned = re.sub(r"\\[OoLlKk]", "", cleaned)
         if "{" in cleaned and "}" in cleaned:
             cleaned = cleaned.replace("{", "").replace("}", "")
-        return cleaned
+        return self._decode_dxf_text(cleaned)
 
     def _parse_dxf_mtext(self, pairs, start_index, shapes, style=None, layer=None, text_styles=None):
         idx = start_index + 1
@@ -2808,6 +3348,64 @@ class MainWindow(QMainWindow):
     def _parse_dxf_hatch(self, pairs, start_index, shapes, style=None, layer=None):
         idx = start_index + 1
         total = len(pairs)
+        loops = []
+
+        def _append_loop(points):
+            if points and len(points) >= 3:
+                loops.append(tuple(points))
+
+        def _extend_path(path_points, edge_points):
+            if not edge_points:
+                return path_points
+            if not path_points:
+                path_points.extend(edge_points)
+                return path_points
+            if path_points[-1] != edge_points[0]:
+                path_points.append(edge_points[0])
+            path_points.extend(edge_points[1:])
+            return path_points
+
+        def _arc_edge_points(cx, cy, radius, start, end, ccw_flag):
+            if radius <= 0:
+                return []
+            start_angle = -start
+            end_angle = -end
+            ccw_screen = not bool(ccw_flag)
+            if ccw_screen:
+                span = self._angle_span(start_angle, end_angle)
+            else:
+                span = -self._angle_span(end_angle, start_angle)
+            steps = max(8, int(abs(span) / 10.0))
+            pts = []
+            cy_screen = -cy
+            for i in range(steps + 1):
+                angle = start_angle + span * (i / steps)
+                radians = math.radians(angle)
+                pts.append((cx + math.cos(radians) * radius, cy_screen + math.sin(radians) * radius))
+            return pts
+
+        def _ellipse_edge_points(cx, cy, major_dx, major_dy, ratio, start_param, end_param):
+            if ratio is None:
+                return []
+            cy_screen = -cy
+            major_vec = (major_dx, -major_dy)
+            minor_vec = (-major_vec[1] * ratio, major_vec[0] * ratio)
+            span = end_param - start_param
+            if span <= 0:
+                span += math.tau
+            steps = max(12, int(abs(span) / (math.tau / 48)))
+            pts = []
+            for i in range(steps + 1):
+                t = start_param + span * (i / steps)
+                x = cx + major_vec[0] * math.cos(t) + minor_vec[0] * math.sin(t)
+                y = cy_screen + major_vec[1] * math.cos(t) + minor_vec[1] * math.sin(t)
+                pts.append((x, y))
+            return pts
+
+        def _spline_edge_points(ctrl_points, fit_points):
+            points = fit_points if len(fit_points) >= 2 else ctrl_points
+            return list(points)
+
         while idx < total:
             code, value = pairs[idx]
             if code == "0":
@@ -2859,17 +3457,157 @@ class MainWindow(QMainWindow):
                             pending_x = None
                             pending_bulge = 0.0
                         elif code3 == "42" and has_bulge:
-                            pending_bulge = self._parse_float(value3) or 0.0
+                            pending_bulge = -(self._parse_float(value3) or 0.0)
                         idx += 1
                     points = self._bulge_vertices_to_points(vertices, closed)
-                    if len(points) >= 2:
-                        shape = {"type": "polyline", "params": (tuple(points), False)}
-                        if layer:
-                            shape["layer"] = layer
-                        if style:
-                            shape["style"] = dict(style)
-                        shapes.append(shape)
+                    _append_loop(points)
+                else:
+                    num_edges = 0
+                    idx += 1
+                    while idx < total:
+                        code2, value2 = pairs[idx]
+                        if code2 == "0" or code2 == "92":
+                            idx -= 1
+                            break
+                        if code2 == "93":
+                            try:
+                                num_edges = int(float(value2))
+                            except ValueError:
+                                num_edges = 0
+                            idx += 1
+                            break
+                        idx += 1
+
+                    path_points = []
+                    for _ in range(num_edges):
+                        while idx < total and pairs[idx][0] not in ("72", "0", "92"):
+                            idx += 1
+                        if idx >= total or pairs[idx][0] in ("0", "92"):
+                            break
+                        if pairs[idx][0] != "72":
+                            break
+                        try:
+                            edge_type = int(float(pairs[idx][1]))
+                        except ValueError:
+                            edge_type = 0
+                        idx += 1
+
+                        if edge_type == 1:
+                            x1 = y1 = x2 = y2 = None
+                            while idx < total:
+                                code3, value3 = pairs[idx]
+                                if code3 in ("72", "0", "92"):
+                                    break
+                                if code3 == "10":
+                                    x1 = self._parse_float(value3)
+                                elif code3 == "20":
+                                    y1 = self._parse_float(value3)
+                                elif code3 == "11":
+                                    x2 = self._parse_float(value3)
+                                elif code3 == "21":
+                                    y2 = self._parse_float(value3)
+                                idx += 1
+                            if None not in (x1, y1, x2, y2):
+                                edge_pts = [(x1, -y1), (x2, -y2)]
+                                _extend_path(path_points, edge_pts)
+                        elif edge_type == 2:
+                            cx = cy = radius = start = end = None
+                            ccw_flag = 1
+                            while idx < total:
+                                code3, value3 = pairs[idx]
+                                if code3 in ("72", "0", "92"):
+                                    break
+                                if code3 == "10":
+                                    cx = self._parse_float(value3)
+                                elif code3 == "20":
+                                    cy = self._parse_float(value3)
+                                elif code3 == "40":
+                                    radius = abs(self._parse_float(value3) or 0.0)
+                                elif code3 == "50":
+                                    start = self._parse_float(value3)
+                                elif code3 == "51":
+                                    end = self._parse_float(value3)
+                                elif code3 == "73":
+                                    try:
+                                        ccw_flag = int(float(value3))
+                                    except ValueError:
+                                        ccw_flag = 1
+                                idx += 1
+                            if None not in (cx, cy, radius, start, end):
+                                edge_pts = _arc_edge_points(cx, cy, radius, start, end, ccw_flag)
+                                _extend_path(path_points, edge_pts)
+                        elif edge_type == 3:
+                            cx = cy = major_dx = major_dy = ratio = None
+                            start_param = 0.0
+                            end_param = 0.0
+                            while idx < total:
+                                code3, value3 = pairs[idx]
+                                if code3 in ("72", "0", "92"):
+                                    break
+                                if code3 == "10":
+                                    cx = self._parse_float(value3)
+                                elif code3 == "20":
+                                    cy = self._parse_float(value3)
+                                elif code3 == "11":
+                                    major_dx = self._parse_float(value3)
+                                elif code3 == "21":
+                                    major_dy = self._parse_float(value3)
+                                elif code3 == "40":
+                                    ratio = self._parse_float(value3)
+                                elif code3 == "50":
+                                    start_param = self._parse_float(value3) or 0.0
+                                elif code3 == "51":
+                                    end_param = self._parse_float(value3) or 0.0
+                                idx += 1
+                            if None not in (cx, cy, major_dx, major_dy, ratio):
+                                edge_pts = _ellipse_edge_points(cx, cy, major_dx, major_dy, ratio, start_param, end_param)
+                                _extend_path(path_points, edge_pts)
+                        elif edge_type == 4:
+                            ctrl_points = []
+                            fit_points = []
+                            pending_ctrl_x = None
+                            pending_fit_x = None
+                            while idx < total:
+                                code3, value3 = pairs[idx]
+                                if code3 in ("72", "0", "92"):
+                                    break
+                                if code3 == "10":
+                                    pending_ctrl_x = self._parse_float(value3)
+                                elif code3 == "20":
+                                    if pending_ctrl_x is not None:
+                                        y_val = self._parse_float(value3)
+                                        if y_val is not None:
+                                            ctrl_points.append((pending_ctrl_x, -y_val))
+                                    pending_ctrl_x = None
+                                elif code3 == "11":
+                                    pending_fit_x = self._parse_float(value3)
+                                elif code3 == "21":
+                                    if pending_fit_x is not None:
+                                        y_val = self._parse_float(value3)
+                                        if y_val is not None:
+                                            fit_points.append((pending_fit_x, -y_val))
+                                    pending_fit_x = None
+                                idx += 1
+                            edge_pts = _spline_edge_points(ctrl_points, fit_points)
+                            _extend_path(path_points, edge_pts)
+                        else:
+                            while idx < total:
+                                code3, _ = pairs[idx]
+                                if code3 in ("72", "0", "92"):
+                                    break
+                                idx += 1
+
+                    _append_loop(path_points)
+                    if idx < total and pairs[idx][0] in ("92", "0"):
+                        idx -= 1
             idx += 1
+        if loops:
+            shape = {"type": "hatch", "params": tuple(loops)}
+            if layer:
+                shape["layer"] = layer
+            if style:
+                shape["style"] = dict(style)
+            shapes.append(shape)
         return idx
 
     def _block_bounds(self, block):
@@ -2891,6 +3629,9 @@ class MainWindow(QMainWindow):
             elif shape_type == "polyline":
                 pts, _ = params
                 points = list(pts)
+            elif shape_type == "hatch":
+                loops = params or []
+                points = [pt for loop in loops for pt in loop]
             elif shape_type == "text":
                 x, y, *_ = params
                 points = [(x, y)]
@@ -2954,18 +3695,8 @@ class MainWindow(QMainWindow):
         if block_name and block_name in blocks:
             block = blocks[block_name]
             block_has_text = any(shape.get("type") == "text" for shape in block.get("shapes", []))
-            use_absolute = False
-            if insert_point is not None:
-                bbox = self._block_bounds(block)
-                if bbox is not None:
-                    bx1, by1, bx2, by2 = bbox
-                    cx = (bx1 + bx2) / 2.0
-                    cy = (by1 + by2) / 2.0
-                    size = max(bx2 - bx1, by2 - by1, 1.0)
-                    distance = math.hypot(cx - insert_point[0], cy - insert_point[1])
-                    if distance <= size * 1.1:
-                        use_absolute = True
-            if use_absolute or insert_point is None:
+            use_absolute = block_name.upper().startswith("*D")
+            if insert_point is None or use_absolute:
                 self._append_block_shapes(
                     shapes,
                     block,
@@ -2993,6 +3724,7 @@ class MainWindow(QMainWindow):
         if (not display_text) or ("<>" in display_text):
             if measurement:
                 display_text = display_text.replace("<>", measurement) if display_text else measurement
+        display_text = self._decode_dxf_text(display_text)
         if display_text and text_x is not None and text_y is not None and not block_has_text:
             shape = {
                 "type": "text",
@@ -3124,39 +3856,16 @@ class MainWindow(QMainWindow):
         block = blocks.get(name)
         if block:
             insert_point = (ins_x, -ins_y)
-            use_absolute = False
-            bbox = self._block_bounds(block)
-            if bbox is not None:
-                bx1, by1, bx2, by2 = bbox
-                cx = (bx1 + bx2) / 2.0
-                cy = (by1 + by2) / 2.0
-                size = max(bx2 - bx1, by2 - by1, 1.0)
-                distance = math.hypot(cx - insert_point[0], cy - insert_point[1])
-                if distance <= size * 1.1:
-                    use_absolute = True
-            if use_absolute:
-                self._append_block_shapes(
-                    shapes,
-                    block,
-                    (0.0, 0.0),
-                    1.0,
-                    1.0,
-                    0.0,
-                    override_style=style,
-                    override_layer=layer,
-                    absolute=True,
-                )
-            else:
-                self._append_block_shapes(
-                    shapes,
-                    block,
-                    insert_point=insert_point,
-                    scale_x=scale_x,
-                    scale_y=scale_y,
-                    rotation=rotation,
-                    override_style=style,
-                    override_layer=layer,
-                )
+            self._append_block_shapes(
+                shapes,
+                block,
+                insert_point=insert_point,
+                scale_x=scale_x,
+                scale_y=scale_y,
+                rotation=rotation,
+                override_style=style,
+                override_layer=layer,
+            )
         return idx
 
     def _append_block_shapes(
@@ -3293,12 +4002,11 @@ class MainWindow(QMainWindow):
 
         shapes = []
         for arc in arcs:
-            span = self._angle_span(arc["start"], arc["end"])
-            if arc.get("_group_size", 1) >= 2 and abs(span) > 180:
-                span = span - 360 if span > 0 else span + 360
+            span = -self._angle_span(arc["start"], arc["end"])
+            start_angle = -arc["start"]
             shape = {
                 "type": arc.get("kind", "doubleline_arc"),
-                "params": (arc["cx"], arc["cy"], arc["radius"], arc["start"], span),
+                "params": (arc["cx"], arc["cy"], arc["radius"], start_angle, span),
             }
             if arc.get("layer"):
                 shape["layer"] = arc.get("layer")
@@ -3308,11 +4016,9 @@ class MainWindow(QMainWindow):
         return shapes
 
     def _angle_span(self, start, end):
-        span = end - start
-        while span <= -360:
-            span += 360
-        while span > 360:
-            span -= 360
+        span = (end - start) % 360.0
+        if abs(span) < 1e-6:
+            span = 360.0
         return span
 
     def _normalize_angle_value(self, angle):
@@ -3522,6 +4228,14 @@ class MainWindow(QMainWindow):
             return min(x1, x2), min(ys), max(x1, x2), max(ys)
         if shape_type == "polyline":
             points, _closed = params
+            if not points:
+                return 0.0, 0.0, 0.0, 0.0
+            xs = [pt[0] for pt in points]
+            ys = [-pt[1] for pt in points]
+            return min(xs), min(ys), max(xs), max(ys)
+        if shape_type == "hatch":
+            loops = params or []
+            points = [pt for loop in loops for pt in loop]
             if not points:
                 return 0.0, 0.0, 0.0, 0.0
             xs = [pt[0] for pt in points]
@@ -3861,7 +4575,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            raw_lines, entries = self._extract_dxf_dimension_params(target_path)
+            raw_lines, entries, encoding = self._extract_dxf_dimension_params(target_path)
         except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "读取失败", f"无法读取 DXF 尺寸参数：\n{exc}")
             if self.output is not None:
@@ -3890,7 +4604,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            with open(target_path, "w", encoding="utf-8", newline="") as handle:
+            with open(target_path, "w", encoding=encoding or "utf-8", newline="") as handle:
                 handle.writelines(raw_lines)
         except OSError as exc:
             QMessageBox.critical(self, "保存失败", f"无法保存 DXF：\n{exc}")
