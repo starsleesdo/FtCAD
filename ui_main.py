@@ -2528,32 +2528,88 @@ class MainWindow(QMainWindow):
             PolylinePath = None
             EdgePath = None
 
+        def _segment_tol(points):
+            min_seg = None
+            for idx in range(len(points) - 1):
+                dx = points[idx + 1][0] - points[idx][0]
+                dy = points[idx + 1][1] - points[idx][1]
+                seg = math.hypot(dx, dy)
+                if seg > 1e-6:
+                    min_seg = seg if min_seg is None else min(min_seg, seg)
+            if min_seg is None:
+                return 0.2
+            return min(5.0, max(0.2, min_seg * 0.1))
+
         def _append_loop(points):
             if not points or len(points) < 3:
                 return
             loop = list(points)
+            xs = [pt[0] for pt in loop]
+            ys = [pt[1] for pt in loop]
+            diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+            tol = _segment_tol(loop)
+            if diag > 1e-6:
+                tol = min(tol, diag * 0.02)
             if loop[0] != loop[-1]:
+                gap = math.hypot(loop[0][0] - loop[-1][0], loop[0][1] - loop[-1][1])
+                if gap > tol:
+                    return
                 loop.append(loop[0])
             if len(loop) >= 4:
                 loops.append(tuple(loop))
 
+        def _ordered_chain(edge_points):
+            if not edge_points:
+                return []
+            tol = max(_segment_tol(points) for points in edge_points if points) if edge_points else 0.2
+            loops_out = []
+            current = []
+            for edge in edge_points:
+                if not edge or len(edge) < 2:
+                    continue
+                edge_pts = list(edge)
+                if not current:
+                    current = edge_pts
+                    continue
+                last = current[-1]
+                d_start = math.hypot(last[0] - edge_pts[0][0], last[1] - edge_pts[0][1])
+                d_end = math.hypot(last[0] - edge_pts[-1][0], last[1] - edge_pts[-1][1])
+                if d_start <= tol or d_end <= tol:
+                    if d_end < d_start:
+                        edge_pts.reverse()
+                        d_start = d_end
+                    if d_start <= tol:
+                        current.extend(edge_pts[1:])
+                    else:
+                        current.extend(edge_pts)
+                else:
+                    if current and math.hypot(current[0][0] - current[-1][0], current[0][1] - current[-1][1]) <= tol:
+                        if current[0] != current[-1]:
+                            current.append(current[0])
+                        loops_out.append(current)
+                    current = edge_pts
+            if current and math.hypot(current[0][0] - current[-1][0], current[0][1] - current[-1][1]) <= tol:
+                if current[0] != current[-1]:
+                    current.append(current[0])
+                loops_out.append(current)
+            return loops_out
+
         def _arc_edge_points(cx, cy, radius, start, end, ccw_flag):
             if radius <= 0:
                 return []
-            start_angle = -start
-            end_angle = -end
-            ccw_screen = not bool(ccw_flag)
-            if ccw_screen:
-                span = self._angle_span(start_angle, end_angle)
+            start_angle = math.radians(start)
+            end_angle = math.radians(end)
+            if bool(ccw_flag):
+                span = (end_angle - start_angle) % (math.tau)
             else:
-                span = -self._angle_span(end_angle, start_angle)
-            steps = max(8, int(abs(span) / 10.0))
+                span = -((start_angle - end_angle) % (math.tau))
+            if abs(span) < 1e-9:
+                span = math.tau
+            steps = max(8, int(abs(span) / (math.pi / 18.0)))
             pts = []
-            cy_screen = -cy
             for i in range(steps + 1):
                 angle = start_angle + span * (i / steps)
-                radians = math.radians(angle)
-                pts.append((cx + math.cos(radians) * radius, cy_screen + math.sin(radians) * radius))
+                pts.append((cx + math.cos(angle) * radius, -(cy + math.sin(angle) * radius)))
             return pts
 
         def _ellipse_edge_points(center, major_axis, ratio, start_angle, end_angle, ccw_flag):
@@ -2561,21 +2617,21 @@ class MainWindow(QMainWindow):
             major_dx, major_dy = major_axis
             major_vec = (major_dx, -major_dy)
             minor_vec = (-major_vec[1] * ratio, major_vec[0] * ratio)
-            start = -start_angle
-            end = -end_angle
-            ccw_screen = not bool(ccw_flag)
-            if ccw_screen:
-                span = self._angle_span(start, end)
+            start = math.radians(start_angle)
+            end = math.radians(end_angle)
+            if bool(ccw_flag):
+                span = (end - start) % (math.tau)
             else:
-                span = -self._angle_span(end, start)
-            steps = max(12, int(abs(span) / 10.0))
+                span = -((start - end) % (math.tau))
+            if abs(span) < 1e-9:
+                span = math.tau
+            steps = max(12, int(abs(span) / (math.pi / 18.0)))
             pts = []
             cy_screen = -cy
             for i in range(steps + 1):
                 angle = start + span * (i / steps)
-                radians = math.radians(angle)
-                x = cx + major_vec[0] * math.cos(radians) + minor_vec[0] * math.sin(radians)
-                y = cy_screen + major_vec[1] * math.cos(radians) + minor_vec[1] * math.sin(radians)
+                x = cx + major_vec[0] * math.cos(angle) + minor_vec[0] * math.sin(angle)
+                y = cy_screen + major_vec[1] * math.cos(angle) + minor_vec[1] * math.sin(angle)
                 pts.append((x, y))
             return pts
 
@@ -2589,7 +2645,7 @@ class MainWindow(QMainWindow):
                 continue
 
             if EdgePath and isinstance(path, EdgePath):
-                path_points = []
+                edge_points = []
                 for edge in path.edges:
                     edge_type = type(edge).__name__
                     if edge_type == "LineEdge":
@@ -2615,20 +2671,10 @@ class MainWindow(QMainWindow):
                         edge_pts = [(pt.x, -pt.y) for pt in points]
                     else:
                         edge_pts = []
-                    if not edge_pts:
-                        continue
-                    if not path_points:
-                        path_points.extend(edge_pts)
-                        continue
-                    last = path_points[-1]
-                    if last == edge_pts[0]:
-                        path_points.extend(edge_pts[1:])
-                    elif last == edge_pts[-1]:
-                        path_points.extend(list(reversed(edge_pts[:-1])))
-                    else:
-                        _append_loop(path_points)
-                        path_points = list(edge_pts)
-                _append_loop(path_points)
+                    if edge_pts:
+                        edge_points.append(edge_pts)
+                for loop in _ordered_chain(edge_points):
+                    _append_loop(loop)
                 continue
 
         return loops
@@ -3356,64 +3402,108 @@ class MainWindow(QMainWindow):
         total = len(pairs)
         loops = []
 
+        def _segment_tol(points):
+            min_seg = None
+            for idx in range(len(points) - 1):
+                dx = points[idx + 1][0] - points[idx][0]
+                dy = points[idx + 1][1] - points[idx][1]
+                seg = math.hypot(dx, dy)
+                if seg > 1e-6:
+                    min_seg = seg if min_seg is None else min(min_seg, seg)
+            if min_seg is None:
+                return 0.2
+            return min(5.0, max(0.2, min_seg * 0.1))
+
         def _append_loop(points):
             if not points or len(points) < 3:
                 return
             loop = list(points)
+            xs = [pt[0] for pt in loop]
+            ys = [pt[1] for pt in loop]
+            diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+            tol = _segment_tol(loop)
+            if diag > 1e-6:
+                tol = min(tol, diag * 0.02)
             if loop[0] != loop[-1]:
+                gap = math.hypot(loop[0][0] - loop[-1][0], loop[0][1] - loop[-1][1])
+                if gap > tol:
+                    return
                 loop.append(loop[0])
             if len(loop) >= 4:
                 loops.append(tuple(loop))
 
-        def _extend_path(path_points, edge_points):
+        def _ordered_chain(edge_points):
             if not edge_points:
-                return path_points
-            if not path_points:
-                path_points.extend(edge_points)
-                return path_points
-            if path_points[-1] == edge_points[0]:
-                path_points.extend(edge_points[1:])
-                return path_points
-            if path_points[-1] == edge_points[-1]:
-                path_points.extend(list(reversed(edge_points[:-1])))
-                return path_points
-            _append_loop(path_points)
-            path_points.clear()
-            path_points.extend(edge_points)
-            return path_points
+                return []
+            tol = max(_segment_tol(points) for points in edge_points if points) if edge_points else 0.2
+            loops_out = []
+            current = []
+            for edge in edge_points:
+                if not edge or len(edge) < 2:
+                    continue
+                edge_pts = list(edge)
+                if not current:
+                    current = edge_pts
+                    continue
+                last = current[-1]
+                d_start = math.hypot(last[0] - edge_pts[0][0], last[1] - edge_pts[0][1])
+                d_end = math.hypot(last[0] - edge_pts[-1][0], last[1] - edge_pts[-1][1])
+                if d_start <= tol or d_end <= tol:
+                    if d_end < d_start:
+                        edge_pts.reverse()
+                        d_start = d_end
+                    if d_start <= tol:
+                        current.extend(edge_pts[1:])
+                    else:
+                        current.extend(edge_pts)
+                else:
+                    if current and math.hypot(current[0][0] - current[-1][0], current[0][1] - current[-1][1]) <= tol:
+                        if current[0] != current[-1]:
+                            current.append(current[0])
+                        loops_out.append(current)
+                    current = edge_pts
+            if current and math.hypot(current[0][0] - current[-1][0], current[0][1] - current[-1][1]) <= tol:
+                if current[0] != current[-1]:
+                    current.append(current[0])
+                loops_out.append(current)
+            return loops_out
 
         def _arc_edge_points(cx, cy, radius, start, end, ccw_flag):
             if radius <= 0:
                 return []
-            start_angle = -start
-            end_angle = -end
-            ccw_screen = not bool(ccw_flag)
-            if ccw_screen:
-                span = self._angle_span(start_angle, end_angle)
+            start_angle = math.radians(start)
+            end_angle = math.radians(end)
+            if bool(ccw_flag):
+                span = (end_angle - start_angle) % (math.tau)
             else:
-                span = -self._angle_span(end_angle, start_angle)
-            steps = max(8, int(abs(span) / 10.0))
+                span = -((start_angle - end_angle) % (math.tau))
+            if abs(span) < 1e-9:
+                span = math.tau
+            steps = max(8, int(abs(span) / (math.pi / 18.0)))
             pts = []
-            cy_screen = -cy
             for i in range(steps + 1):
                 angle = start_angle + span * (i / steps)
-                radians = math.radians(angle)
-                pts.append((cx + math.cos(radians) * radius, cy_screen + math.sin(radians) * radius))
+                pts.append((cx + math.cos(angle) * radius, -(cy + math.sin(angle) * radius)))
             return pts
 
-        def _ellipse_edge_points(cx, cy, major_dx, major_dy, ratio, start_param, end_param):
+        def _ellipse_edge_points(cx, cy, major_dx, major_dy, ratio, start_param, end_param, ccw_flag):
             if ratio is None:
                 return []
             cy_screen = -cy
             major_vec = (major_dx, -major_dy)
             minor_vec = (-major_vec[1] * ratio, major_vec[0] * ratio)
-            span = end_param - start_param
-            if span <= 0:
-                span += math.tau
-            steps = max(12, int(abs(span) / (math.tau / 48)))
+            start = start_param
+            end = end_param
+            if bool(ccw_flag):
+                span = (end - start) % (math.tau)
+            else:
+                span = -((start - end) % (math.tau))
+            if abs(span) < 1e-9:
+                span = math.tau
+            steps = max(12, int(abs(span) / (math.pi / 18.0)))
             pts = []
             for i in range(steps + 1):
-                t = start_param + span * (i / steps)
+                t = start + span * (i / steps)
                 x = cx + major_vec[0] * math.cos(t) + minor_vec[0] * math.sin(t)
                 y = cy_screen + major_vec[1] * math.cos(t) + minor_vec[1] * math.sin(t)
                 pts.append((x, y))
@@ -3495,7 +3585,7 @@ class MainWindow(QMainWindow):
                             break
                         idx += 1
 
-                    path_points = []
+                    edge_points = []
                     for _ in range(num_edges):
                         while idx < total and pairs[idx][0] not in ("72", "0", "92"):
                             idx += 1
@@ -3526,7 +3616,7 @@ class MainWindow(QMainWindow):
                                 idx += 1
                             if None not in (x1, y1, x2, y2):
                                 edge_pts = [(x1, -y1), (x2, -y2)]
-                                _extend_path(path_points, edge_pts)
+                                edge_points.append(edge_pts)
                         elif edge_type == 2:
                             cx = cy = radius = start = end = None
                             ccw_flag = 1
@@ -3552,9 +3642,11 @@ class MainWindow(QMainWindow):
                                 idx += 1
                             if None not in (cx, cy, radius, start, end):
                                 edge_pts = _arc_edge_points(cx, cy, radius, start, end, ccw_flag)
-                                _extend_path(path_points, edge_pts)
+                                if edge_pts:
+                                    edge_points.append(edge_pts)
                         elif edge_type == 3:
                             cx = cy = major_dx = major_dy = ratio = None
+                            ccw_flag = 1
                             start_param = 0.0
                             end_param = 0.0
                             while idx < total:
@@ -3575,10 +3667,16 @@ class MainWindow(QMainWindow):
                                     start_param = self._parse_float(value3) or 0.0
                                 elif code3 == "51":
                                     end_param = self._parse_float(value3) or 0.0
+                                elif code3 == "73":
+                                    try:
+                                        ccw_flag = int(float(value3))
+                                    except ValueError:
+                                        ccw_flag = 1
                                 idx += 1
                             if None not in (cx, cy, major_dx, major_dy, ratio):
-                                edge_pts = _ellipse_edge_points(cx, cy, major_dx, major_dy, ratio, start_param, end_param)
-                                _extend_path(path_points, edge_pts)
+                                edge_pts = _ellipse_edge_points(cx, cy, major_dx, major_dy, ratio, start_param, end_param, ccw_flag)
+                                if edge_pts:
+                                    edge_points.append(edge_pts)
                         elif edge_type == 4:
                             ctrl_points = []
                             fit_points = []
@@ -3606,7 +3704,8 @@ class MainWindow(QMainWindow):
                                     pending_fit_x = None
                                 idx += 1
                             edge_pts = _spline_edge_points(ctrl_points, fit_points)
-                            _extend_path(path_points, edge_pts)
+                            if edge_pts:
+                                edge_points.append(edge_pts)
                         else:
                             while idx < total:
                                 code3, _ = pairs[idx]
@@ -3614,7 +3713,8 @@ class MainWindow(QMainWindow):
                                     break
                                 idx += 1
 
-                    _append_loop(path_points)
+                    for loop in _ordered_chain(edge_points):
+                        _append_loop(loop)
                     if idx < total and pairs[idx][0] in ("92", "0"):
                         idx -= 1
             idx += 1

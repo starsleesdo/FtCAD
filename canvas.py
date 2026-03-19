@@ -179,11 +179,32 @@ class Canvas(QWidget):
             return
         valid_loops = []
         min_x = min_y = max_x = max_y = None
+        def _segment_tol(points):
+            min_seg = None
+            for idx in range(len(points) - 1):
+                dx = points[idx + 1][0] - points[idx][0]
+                dy = points[idx + 1][1] - points[idx][1]
+                seg = math.hypot(dx, dy)
+                if seg > 1e-6:
+                    min_seg = seg if min_seg is None else min(min_seg, seg)
+            if min_seg is None:
+                return 0.2
+            return min(5.0, max(0.2, min_seg * 0.1))
+
         for loop in loops:
             if not loop or len(loop) < 3:
                 continue
             points = list(loop)
+            xs = [pt[0] for pt in points]
+            ys = [pt[1] for pt in points]
+            diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+            tol = _segment_tol(points)
+            if diag > 1e-6:
+                tol = min(tol, diag * 0.02)
             if points[0] != points[-1]:
+                gap = math.hypot(points[0][0] - points[-1][0], points[0][1] - points[-1][1])
+                if gap > tol:
+                    continue
                 points.append(points[0])
             valid_loops.append(points)
             for x, y in points:
@@ -212,10 +233,13 @@ class Canvas(QWidget):
             path.addPolygon(polygon)
             path.closeSubpath()
 
+        width = max(1.0, max_x - min_x)
         height = max(1.0, max_y - min_y)
-        spacing = max(6.0, float(self.grid_step) * 0.5)
-        start = min_x - height
-        end = max_x + height
+        min_dim = min(width, height)
+        spacing = max(2.0, min(12.0, min_dim / 80.0))
+        length = math.hypot(width, height)
+        start = min_x - length
+        end = max_x + length
 
         painter.save()
         painter.setPen(pen)
@@ -223,7 +247,7 @@ class Canvas(QWidget):
         painter.setClipPath(path)
         x = start
         while x <= end:
-            painter.drawLine(QPointF(x, max_y), QPointF(x + height, min_y))
+            painter.drawLine(QPointF(x, max_y), QPointF(x + length, min_y))
             x += spacing
         painter.restore()
 
