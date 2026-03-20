@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QPoint, QPointF, QRectF, Signal
 class Canvas(QWidget):
     point_info = Signal(str)
     pointer_info = Signal(str)
+    tool_changed = Signal(str)
 
     def __init__(self, mode_state):
         super().__init__()
@@ -865,6 +866,13 @@ class Canvas(QWidget):
         self._last_doubleline_segment_index = None
         self.update()
 
+    def _switch_to_select(self, notify=False):
+        self.current_tool = "select"
+        self.cancel_active_tool()
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+        if notify:
+            self.tool_changed.emit("select")
 
     def _scale_value(self, value, anchor, factor):
         return anchor + (value - anchor) * factor
@@ -1128,7 +1136,7 @@ class Canvas(QWidget):
                 'distribute',
             }
             if self.current_tool in cancel_tools:
-                self.cancel_active_tool()
+                self._switch_to_select(notify=True)
                 return
             super().mousePressEvent(event)
             return

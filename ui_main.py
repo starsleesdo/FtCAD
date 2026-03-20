@@ -57,6 +57,7 @@ from canvas import Canvas
 from commands import CommandProcessor
 from modes import ModeState
 from heat_exchanger_data import load_upcomer_pdf_data, resolve_inner_cylinder_spec, summarize_extraction
+from tool_actions import ToolActionContext, ToolActionHandler
 from ui_tabs import ALL_TABS, RibbonTabConfig
 
 
@@ -825,6 +826,7 @@ class MainWindow(QMainWindow):
         self._layer_table_updating = False
         self._syncing_layer_ui = False
         self.upcomer_pdf_data = None
+        self.tool_actions = None
 
         self._build_option_actions()
         self._load_upcomer_pdf_data()
@@ -928,6 +930,7 @@ class MainWindow(QMainWindow):
         self._create_default_document()
         self.main_splitter.setSizes([780, 84])
         self.workspace_splitter.setSizes([0, 1])
+        self.tool_actions = ToolActionHandler(self._build_tool_action_context())
 
     def _build_option_actions(self):
         self.interface_action_group = QActionGroup(self)
@@ -1889,6 +1892,7 @@ class MainWindow(QMainWindow):
         canvas = Canvas(self.mode_state)
         canvas.point_info.connect(self._on_canvas_point)
         canvas.pointer_info.connect(self.coord_label.setText)
+        canvas.tool_changed.connect(self._on_canvas_tool_changed)
         canvas.set_theme(**self.canvas_theme)
         canvas.set_symmetry_mode(self.mode_state.flag("symmetry"))
         canvas.set_grid_spacing(
@@ -1950,9 +1954,6 @@ class MainWindow(QMainWindow):
         return data
 
     def _load_dxf_document(self, path):
-        payload = self._load_dxf_document_ezdxf(path)
-        if payload:
-            return payload
         cleaned_lines, _, _ = self._read_dxf_lines(path)
         if len(cleaned_lines) < 2:
             raise ValueError("DXF 内容为空")
@@ -2060,93 +2061,6 @@ class MainWindow(QMainWindow):
                 "(LINE / CIRCLE / ARC / LWPOLYLINE / POLYLINE / INSERT / DIMENSION / TEXT / "
                 "SPLINE / ELLIPSE / LEADER / SOLID / HATCH)"
             )
-        return {
-            "name": os.path.splitext(os.path.basename(path))[0],
-            "template": "二维草图",
-            "shapes": shapes,
-        }
-
-    def _try_oda_convert(self, path):
-        cmd_template = os.environ.get("ODA_CONVERTER_CMD")
-        if not cmd_template:
-            return None
-        try:
-            import tempfile
-            import subprocess
-        except Exception:
-            return None
-
-        source_dir = os.path.dirname(path)
-        file_name = os.path.basename(path)
-        out_dir = tempfile.mkdtemp(prefix="oda_")
-        out_path = os.path.join(out_dir, f"{os.path.splitext(file_name)[0]}.dxf")
-
-        cmd = cmd_template.format(
-            input=path,
-            input_dir=source_dir,
-            input_filter=file_name,
-            output_dir=out_dir,
-            output=out_path,
-        )
-        try:
-            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            return None
-
-        if os.path.exists(out_path):
-            return out_path
-        try:
-            for entry in os.listdir(out_dir):
-                if entry.lower().endswith(".dxf"):
-                    return os.path.join(out_dir, entry)
-        except OSError:
-            return None
-        return None
-
-    def _load_dxf_document_ezdxf(self, path):
-        try:
-            import ezdxf
-        except Exception:
-            return None
-
-        force_oda = str(os.environ.get("ODA_CONVERTER_ALWAYS", "")).strip().lower() in ("1", "true", "yes")
-        if force_oda:
-            converted = self._try_oda_convert(path)
-            if converted:
-                path = converted
-
-        doc = None
-        try:
-            doc = ezdxf.readfile(path)
-        except Exception:
-            converted = self._try_oda_convert(path)
-            if converted:
-                try:
-                    doc = ezdxf.readfile(converted)
-                except Exception:
-                    doc = None
-            if doc is None:
-                try:
-                    from ezdxf import recover
-                    doc, _auditor = recover.readfile(path)
-                except Exception:
-                    return None
-
-        if doc is None:
-            return None
-
-        layer_styles = self._ezdxf_layer_styles(doc)
-        shapes = []
-        try:
-            modelspace = doc.modelspace()
-            for entity in modelspace:
-                self._collect_ezdxf_entity_shapes(entity, shapes, layer_styles)
-        except Exception:
-            return None
-
-        if not shapes:
-            return None
-
         return {
             "name": os.path.splitext(os.path.basename(path))[0],
             "template": "二维草图",
@@ -2274,419 +2188,6 @@ class MainWindow(QMainWindow):
             if lw is not None and lw > 0:
                 style["lineweight"] = f"{lw / 100.0:.2f}"
         return style or None
-
-    def _ezdxf_layer_styles(self, doc):
-        styles = {}
-        try:
-            layers = doc.layers
-        except Exception:
-            return styles
-        for layer in layers:
-            entry = {}
-            try:
-                entry["name"] = layer.dxf.name
-                entry["color_index"] = layer.dxf.color
-                entry["true_color"] = getattr(layer.dxf, "true_color", None)
-                entry["linetype"] = layer.dxf.linetype
-                entry["lineweight"] = layer.dxf.lineweight
-            except Exception:
-                continue
-            style = self._layer_style_from_entry(entry)
-            if style:
-                styles[entry["name"]] = style
-        return styles
-
-    def _ezdxf_entity_style(self, entity, layer_styles):
-        layer_name = None
-        style = {}
-        try:
-            layer_name = entity.dxf.layer
-        except Exception:
-            layer_name = None
-        base = layer_styles.get(layer_name)
-        if base:
-            style.update(base)
-
-        try:
-            true_color = getattr(entity.dxf, "true_color", None)
-        except Exception:
-            true_color = None
-        if true_color is not None:
-            color = self._truecolor_to_hex(true_color)
-            if color:
-                style["color"] = color
-        else:
-            try:
-                color_index = entity.dxf.color
-            except Exception:
-                color_index = None
-            if color_index is not None and color_index not in (0, 256):
-                color = self._aci_color_to_hex(abs(color_index))
-                if color:
-                    style["color"] = color
-
-        try:
-            linetype = entity.dxf.linetype
-        except Exception:
-            linetype = None
-        if linetype and str(linetype).upper() not in ("BYLAYER", "BYBLOCK"):
-            style["linetype"] = linetype
-
-        try:
-            lineweight = entity.dxf.lineweight
-        except Exception:
-            lineweight = None
-        if lineweight is not None and lineweight > 0:
-            style["lineweight"] = f"{lineweight / 100.0:.2f}"
-
-        return layer_name, style or None
-
-    def _collect_ezdxf_entity_shapes(self, entity, shapes, layer_styles):
-        def _vec_xy(vec):
-            try:
-                return vec.x, vec.y
-            except AttributeError:
-                return vec[0], vec[1]
-
-        try:
-            dxftype = entity.dxftype()
-        except Exception:
-            return
-
-        if dxftype in ("INSERT", "DIMENSION"):
-            try:
-                for sub in entity.virtual_entities():
-                    self._collect_ezdxf_entity_shapes(sub, shapes, layer_styles)
-            except Exception:
-                pass
-            if dxftype == "INSERT":
-                try:
-                    for attrib in entity.attribs:
-                        self._collect_ezdxf_entity_shapes(attrib, shapes, layer_styles)
-                except Exception:
-                    pass
-            return
-
-        layer_name, style = self._ezdxf_entity_style(entity, layer_styles)
-
-        def _append(shape):
-            if layer_name:
-                shape["layer"] = layer_name
-            if style:
-                shape["style"] = dict(style)
-            shapes.append(shape)
-
-        if dxftype == "LINE":
-            start = entity.dxf.start
-            end = entity.dxf.end
-            x1, y1 = _vec_xy(start)
-            x2, y2 = _vec_xy(end)
-            _append({"type": "line", "params": (x1, -y1, x2, -y2)})
-            return
-
-        if dxftype == "CIRCLE":
-            center = entity.dxf.center
-            cx, cy = _vec_xy(center)
-            radius = abs(entity.dxf.radius)
-            _append({"type": "circle", "params": (cx, -cy, radius)})
-            return
-
-        if dxftype == "ARC":
-            center = entity.dxf.center
-            cx, cy = _vec_xy(center)
-            radius = abs(entity.dxf.radius)
-            start = entity.dxf.start_angle
-            end = entity.dxf.end_angle
-            span = -self._angle_span(start, end)
-            start_angle = -start
-            _append({"type": "arc_angle", "params": (cx, -cy, radius, start_angle, span)})
-            return
-
-        if dxftype == "ELLIPSE":
-            center = entity.dxf.center
-            major = entity.dxf.major_axis
-            ratio = entity.dxf.ratio
-            start_param = entity.dxf.start_param
-            end_param = entity.dxf.end_param
-            cx, cy = _vec_xy(center)
-            major_dx, major_dy = _vec_xy(major)
-            major_vec = (major_dx, -major_dy)
-            minor_vec = (-major_vec[1] * ratio, major_vec[0] * ratio)
-            span = end_param - start_param
-            if span <= 0:
-                span += math.tau
-            steps = max(12, int(abs(span) / (math.tau / 48)))
-            points = []
-            cy_screen = -cy
-            for i in range(steps + 1):
-                t = start_param + span * (i / steps)
-                x = cx + major_vec[0] * math.cos(t) + minor_vec[0] * math.sin(t)
-                y = cy_screen + major_vec[1] * math.cos(t) + minor_vec[1] * math.sin(t)
-                points.append((x, y))
-            if len(points) >= 2:
-                _append({"type": "polyline", "params": (tuple(points), False)})
-            return
-
-        if dxftype == "LWPOLYLINE":
-            try:
-                closed = bool(entity.closed)
-            except Exception:
-                closed = False
-            vertices = []
-            for x, y, bulge in entity.get_points("xyb"):
-                vertices.append({"x": x, "y": -y, "bulge": -(bulge or 0.0)})
-            points = self._bulge_vertices_to_points(vertices, closed)
-            if len(points) >= 2:
-                _append({"type": "polyline", "params": (tuple(points), False)})
-            return
-
-        if dxftype == "POLYLINE":
-            try:
-                closed = bool(entity.is_closed)
-            except Exception:
-                closed = False
-            vertices = []
-            try:
-                iterator = entity.vertices
-            except Exception:
-                iterator = []
-            for vtx in iterator:
-                try:
-                    x, y = _vec_xy(vtx.dxf.location)
-                except Exception:
-                    continue
-                bulge = getattr(vtx.dxf, "bulge", 0.0) or 0.0
-                vertices.append({"x": x, "y": -y, "bulge": -bulge})
-            points = self._bulge_vertices_to_points(vertices, closed)
-            if len(points) >= 2:
-                _append({"type": "polyline", "params": (tuple(points), False)})
-            return
-
-        if dxftype == "SPLINE":
-            points = []
-            try:
-                for pt in entity.flattening(0.5):
-                    x, y = _vec_xy(pt)
-                    points.append((x, -y))
-            except Exception:
-                try:
-                    pts = entity.fit_points
-                except Exception:
-                    pts = []
-                if len(pts) < 2:
-                    try:
-                        pts = entity.control_points
-                    except Exception:
-                        pts = []
-                for pt in pts:
-                    x, y = _vec_xy(pt)
-                    points.append((x, -y))
-            if len(points) >= 2:
-                _append({"type": "polyline", "params": (tuple(points), False)})
-            return
-
-        if dxftype in ("TEXT", "ATTRIB", "ATTDEF"):
-            insert = entity.dxf.insert
-            x, y = _vec_xy(insert)
-            height = getattr(entity.dxf, "height", None)
-            rotation = getattr(entity.dxf, "rotation", 0.0) or 0.0
-            text_value = getattr(entity.dxf, "text", "")
-            text_value = self._decode_dxf_text(text_value)
-            _append({"type": "text", "params": (x, -y, text_value, height, -rotation)})
-            return
-
-        if dxftype == "MTEXT":
-            insert = entity.dxf.insert
-            x, y = _vec_xy(insert)
-            height = getattr(entity.dxf, "char_height", None)
-            rotation = getattr(entity.dxf, "rotation", 0.0) or 0.0
-            try:
-                text_value = entity.plain_text()
-            except Exception:
-                text_value = getattr(entity.dxf, "text", "")
-            text_value = self._decode_dxf_text(text_value)
-            _append({"type": "text", "params": (x, -y, text_value, height, -rotation)})
-            return
-
-        if dxftype == "SOLID":
-            points = []
-            for key in ("vtx0", "vtx1", "vtx2", "vtx3"):
-                try:
-                    v = getattr(entity.dxf, key)
-                except Exception:
-                    v = None
-                if v is None:
-                    continue
-                x, y = _vec_xy(v)
-                points.append((x, -y))
-            if len(points) >= 3:
-                _append({"type": "polyline", "params": (tuple(points), True)})
-            return
-
-        if dxftype == "HATCH":
-            loops = self._ezdxf_hatch_loops(entity)
-            if loops:
-                _append({"type": "hatch", "params": tuple(loops)})
-            return
-
-    def _ezdxf_hatch_loops(self, hatch):
-        loops = []
-        try:
-            from ezdxf.entities.boundary_paths import PolylinePath, EdgePath
-        except Exception:
-            PolylinePath = None
-            EdgePath = None
-
-        def _segment_tol(points):
-            min_seg = None
-            for idx in range(len(points) - 1):
-                dx = points[idx + 1][0] - points[idx][0]
-                dy = points[idx + 1][1] - points[idx][1]
-                seg = math.hypot(dx, dy)
-                if seg > 1e-6:
-                    min_seg = seg if min_seg is None else min(min_seg, seg)
-            if min_seg is None:
-                return 0.2
-            return min(5.0, max(0.2, min_seg * 0.1))
-
-        def _append_loop(points):
-            if not points or len(points) < 3:
-                return
-            loop = list(points)
-            xs = [pt[0] for pt in loop]
-            ys = [pt[1] for pt in loop]
-            diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
-            tol = _segment_tol(loop)
-            if diag > 1e-6:
-                tol = min(tol, diag * 0.02)
-            if loop[0] != loop[-1]:
-                gap = math.hypot(loop[0][0] - loop[-1][0], loop[0][1] - loop[-1][1])
-                if gap > tol:
-                    return
-                loop.append(loop[0])
-            if len(loop) >= 4:
-                loops.append(tuple(loop))
-
-        def _ordered_chain(edge_points):
-            if not edge_points:
-                return []
-            tol = max(_segment_tol(points) for points in edge_points if points) if edge_points else 0.2
-            loops_out = []
-            current = []
-            for edge in edge_points:
-                if not edge or len(edge) < 2:
-                    continue
-                edge_pts = list(edge)
-                if not current:
-                    current = edge_pts
-                    continue
-                last = current[-1]
-                d_start = math.hypot(last[0] - edge_pts[0][0], last[1] - edge_pts[0][1])
-                d_end = math.hypot(last[0] - edge_pts[-1][0], last[1] - edge_pts[-1][1])
-                if d_start <= tol or d_end <= tol:
-                    if d_end < d_start:
-                        edge_pts.reverse()
-                        d_start = d_end
-                    if d_start <= tol:
-                        current.extend(edge_pts[1:])
-                    else:
-                        current.extend(edge_pts)
-                else:
-                    if current and math.hypot(current[0][0] - current[-1][0], current[0][1] - current[-1][1]) <= tol:
-                        if current[0] != current[-1]:
-                            current.append(current[0])
-                        loops_out.append(current)
-                    current = edge_pts
-            if current and math.hypot(current[0][0] - current[-1][0], current[0][1] - current[-1][1]) <= tol:
-                if current[0] != current[-1]:
-                    current.append(current[0])
-                loops_out.append(current)
-            return loops_out
-
-        def _arc_edge_points(cx, cy, radius, start, end, ccw_flag):
-            if radius <= 0:
-                return []
-            start_angle = math.radians(start)
-            end_angle = math.radians(end)
-            if bool(ccw_flag):
-                span = (end_angle - start_angle) % (math.tau)
-            else:
-                span = -((start_angle - end_angle) % (math.tau))
-            if abs(span) < 1e-9:
-                span = math.tau
-            steps = max(8, int(abs(span) / (math.pi / 18.0)))
-            pts = []
-            for i in range(steps + 1):
-                angle = start_angle + span * (i / steps)
-                pts.append((cx + math.cos(angle) * radius, -(cy + math.sin(angle) * radius)))
-            return pts
-
-        def _ellipse_edge_points(center, major_axis, ratio, start_angle, end_angle, ccw_flag):
-            cx, cy = center
-            major_dx, major_dy = major_axis
-            major_vec = (major_dx, -major_dy)
-            minor_vec = (-major_vec[1] * ratio, major_vec[0] * ratio)
-            start = math.radians(start_angle)
-            end = math.radians(end_angle)
-            if bool(ccw_flag):
-                span = (end - start) % (math.tau)
-            else:
-                span = -((start - end) % (math.tau))
-            if abs(span) < 1e-9:
-                span = math.tau
-            steps = max(12, int(abs(span) / (math.pi / 18.0)))
-            pts = []
-            cy_screen = -cy
-            for i in range(steps + 1):
-                angle = start + span * (i / steps)
-                x = cx + major_vec[0] * math.cos(angle) + minor_vec[0] * math.sin(angle)
-                y = cy_screen + major_vec[1] * math.cos(angle) + minor_vec[1] * math.sin(angle)
-                pts.append((x, y))
-            return pts
-
-        for path in hatch.paths:
-            if PolylinePath and isinstance(path, PolylinePath):
-                vertices = []
-                for x, y, bulge in path.vertices:
-                    vertices.append({"x": x, "y": -y, "bulge": -(bulge or 0.0)})
-                points = self._bulge_vertices_to_points(vertices, bool(path.is_closed))
-                _append_loop(points)
-                continue
-
-            if EdgePath and isinstance(path, EdgePath):
-                edge_points = []
-                for edge in path.edges:
-                    edge_type = type(edge).__name__
-                    if edge_type == "LineEdge":
-                        start = edge.start
-                        end = edge.end
-                        edge_pts = [(start.x, -start.y), (end.x, -end.y)]
-                    elif edge_type == "ArcEdge":
-                        center = edge.center
-                        edge_pts = _arc_edge_points(center.x, center.y, edge.radius, edge.start_angle, edge.end_angle, edge.ccw)
-                    elif edge_type == "EllipseEdge":
-                        center = edge.center
-                        major = edge.major_axis
-                        edge_pts = _ellipse_edge_points(
-                            (center.x, center.y),
-                            (major.x, major.y),
-                            edge.ratio,
-                            edge.start_angle,
-                            edge.end_angle,
-                            edge.ccw,
-                        )
-                    elif edge_type == "SplineEdge":
-                        points = edge.fit_points if edge.fit_points else edge.control_points
-                        edge_pts = [(pt.x, -pt.y) for pt in points]
-                    else:
-                        edge_pts = []
-                    if edge_pts:
-                        edge_points.append(edge_pts)
-                for loop in _ordered_chain(edge_points):
-                    _append_loop(loop)
-                continue
-
-        return loops
 
     def _parse_dxf_layer_table(self, pairs, start_index, layer_styles):
         idx = start_index + 1
@@ -4815,52 +4316,80 @@ class MainWindow(QMainWindow):
         self._center_canvas_on_shapes(canvas)
 
     def _tool_clicked(self, name, display_name=None):
-        canvas = self.current_canvas()
-        if canvas is None:
+        if self.tool_actions is None:
             return
+        self.tool_actions.handle_tool(name, display_name)
 
-        key = "".join(ch for ch in name.lower() if ch.isalnum() or ch == "_")
-        label = display_name or TOOL_TIPS.get(name, name)
+    def _build_tool_action_context(self):
+        return ToolActionContext(
+            tool_tips=TOOL_TIPS,
+            drawing_tools=DRAWING_TOOLS,
+            inner_cylinder_tool="1内筒体组件",
+            pending_component_tools={"2内筒体", "3 下接环组件", "3-1 下连接圈", "3-2下连接环"},
+            layer_props_tool="Layer Props",
+            table_tool="Table",
+            color_tool="Color",
+            get_canvas=self.current_canvas,
+            set_current_tool_status=self._set_current_tool_status,
+            open_inner_cylinder_params_dialog=self._open_inner_cylinder_params_dialog,
+            notify_component_pending=self._notify_component_pending,
+            toggle_layer_manager=self._toggle_layer_manager,
+            on_layer_manager_opened=self._on_layer_manager_opened,
+            request_table_insert=self._request_table_insert,
+            on_table_inserted=self._on_table_inserted,
+            request_color=self._request_color,
+            apply_layer_color=self._apply_layer_color,
+            on_tool_enabled=self._on_tool_enabled,
+            on_tool_placeholder=self._on_tool_placeholder,
+        )
+
+    def _set_current_tool_status(self, label):
         self.current_tool_name = label
-        if name == "1内筒体组件":
-            self._open_inner_cylinder_params_dialog()
+        self.status_label.setText(f"当前工具: {label}")
+
+    def _on_tool_enabled(self, label):
+        self.output.append(f"工具已启用: {label}")
+
+    def _on_tool_placeholder(self, label):
+        self.output.append(f"工具: {label} | 当前为界面占位。")
+
+    def _on_layer_manager_opened(self):
+        self.status_label.setText("图层特性管理器已打开")
+
+    def _request_table_insert(self):
+        dialog = TableInsertDialog(self)
+        self._center_dialog(dialog)
+        if dialog.exec() == QDialog.Accepted:
+            return dialog.values()
+        return None
+
+    def _on_table_inserted(self, settings):
+        self.output.append(f"插入表格: {settings}")
+        self.status_label.setText("表格样式已选择")
+
+    def _request_color(self):
+        dialog = QColorDialog(self)
+        dialog.setWindowTitle("选择颜色")
+        dialog.setOption(QColorDialog.ShowAlphaChannel, False)
+        if dialog.exec() == QDialog.Accepted:
+            chosen = dialog.currentColor()
+            return self._color_name_from_qcolor(chosen)
+        return None
+
+    def _apply_layer_color(self, color_name):
+        if not color_name:
             return
-        if name in ("2内筒体", "3 下接环组件", "3-1 下连接圈", "3-2下连接环"):
-            self._notify_component_pending(label)
-            return
-        if name == "Layer Props":
-            self._toggle_layer_manager(True)
-            self.status_label.setText("图层特性管理器已打开")
-            return
-        if name == "Table":
-            dialog = TableInsertDialog(self)
-            self._center_dialog(dialog)
-            if dialog.exec() == QDialog.Accepted:
-                settings = dialog.values()
-                self.output.append(f"插入表格: {settings}")
-                self.status_label.setText("表格样式已选择")
-            return
-        if name == "Color":
-            dialog = QColorDialog(self)
-            dialog.setWindowTitle("选择颜色")
-            dialog.setOption(QColorDialog.ShowAlphaChannel, False)
-            if dialog.exec() == QDialog.Accepted:
-                chosen = dialog.currentColor()
-                color_name = self._color_name_from_qcolor(chosen)
-                if color_name:
-                    self._set_combo_value(self.prop_color_combo, color_name)
-                    self._on_layer_property_changed("color", color_name)
-            return
-        if key in DRAWING_TOOLS:
-            canvas.set_tool(DRAWING_TOOLS[key])
-            self.output.append(f"工具已启用: {label}")
-            self.status_label.setText(f"当前工具: {label}")
-        else:
-            self.output.append(f"工具: {label} | 当前为界面占位。")
+        self._set_combo_value(self.prop_color_combo, color_name)
+        self._on_layer_property_changed("color", color_name)
 
     def _on_canvas_point(self, text):
         title = self.current_tool_name or "绘图"
         self.status_label.setText(f"{title} | {text}")
+
+    def _on_canvas_tool_changed(self, tool_key):
+        if tool_key == "select":
+            label = TOOL_TIPS.get("Select", "Select")
+            self._set_current_tool_status(label)
 
     def _on_command_entered(self):
         text = self.input.text().strip()

@@ -12,6 +12,7 @@ Features implemented (minimal prototype):
 - Menu area, toolbar tabs, canvas area, command input/display, mode toggles
 - Command parser supports: `line x1 y1 x2 y2`, `circle cx cy r`, `clear`
 - Grid display toggle
+- Open `DXF` drawings
 
 Notes:
 - This is a starting scaffold. Many CAD features are placeholders.
